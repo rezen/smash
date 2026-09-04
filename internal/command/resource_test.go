@@ -193,6 +193,10 @@ func TestRedact(t *testing.T) {
 	if got := h.String(); strings.Contains(got, "topsecret") || !strings.Contains(got, "-hmac REDACTED") {
 		t.Errorf("rest redaction wrong: %q", got)
 	}
+	d := Redact(Parse([]string{"docker", "login", "--username", "bob", "--password", "hunter2", "registry.example"}).TypedParams()).(DockerParams)
+	if got := d.String(); strings.Contains(got, "hunter2") || !strings.Contains(got, "--password REDACTED") {
+		t.Errorf("docker password redaction wrong: %q", got)
+	}
 	// The as-run argv is redacted in place, both value forms.
 	if got := strings.Join(Parse([]string{"mysql", "-h", "db", "-p", "hunter2", "--password=x", "app"}).RedactedArgv(), " "); got != "mysql -h db -p REDACTED --password=REDACTED app" {
 		t.Errorf("RedactedArgv = %q", got)

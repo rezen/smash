@@ -8,7 +8,7 @@ import (
 
 // networkCommands are the families capable of egress; each implements Networked.
 var networkCommands = append([]Command{
-	Curl{}, Wget{}, Openssl{}, SSH{}, Scp{}, Rsync{}, Netcat{}, Git{}, Perl{}, Python{}, Gpg{},
+	Curl{}, Wget{}, Openssl{}, SSH{}, Scp{}, Rsync{}, DockerCommand{}, Netcat{}, Git{}, Perl{}, Python{}, Gpg{},
 }, netTools...)
 
 // Request is the parsed intent of a downloader (curl/wget) invocation — what a

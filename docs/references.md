@@ -1,0 +1,2 @@
+- https://yotam.net/posts/the-audacity-of-piping-curl-to-bash/
+- https://kubikpixel.github.io/pipeinstall/

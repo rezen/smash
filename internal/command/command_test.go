@@ -31,6 +31,15 @@ func TestRegistryRejectsDuplicates(t *testing.T) {
 	if _, ok := Lookup("sshpass").(Wrapper); !ok {
 		t.Error("sshpass should be a Wrapper")
 	}
+	for _, name := range []string{"docker", "podman", "nerdctl"} {
+		cmd := Lookup(name)
+		if _, ok := cmd.(DockerCommand); !ok {
+			t.Errorf("%s command = %T, want DockerCommand", name, cmd)
+		}
+		if _, ok := cmd.(Structured); !ok {
+			t.Errorf("%s must expose DockerParams", name)
+		}
+	}
 }
 
 func TestParseIndicators(t *testing.T) {
@@ -89,6 +98,10 @@ func TestParseIndicators(t *testing.T) {
 		{[]string{"svn", "status"}, "status", "", false},
 		{[]string{"hg", "clone", "https://hg.example/r"}, "clone", "https://hg.example/r", true},
 		{[]string{"docker", "pull", "alpine"}, "pull", "alpine", true},
+		{[]string{"docker", "run", "-t", "alpine"}, "run", "alpine", true}, // -t is a bool here
+		{[]string{"docker", "build", "-t", "app:latest", "."}, "build", ".", true},
+		{[]string{"docker", "build", "--pull", "."}, "build", ".", true}, // --pull is a bool here
+		{[]string{"docker", "pull", "-a", "alpine"}, "pull", "alpine", true},
 		{[]string{"docker", "ps"}, "ps", "", false},
 		{[]string{"mysql", "-h", "db.example", "-u", "root"}, "", "db.example", true},
 		{[]string{"mysql", "-u", "root", "app"}, "", "", false}, // local socket

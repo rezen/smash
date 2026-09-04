@@ -19,7 +19,7 @@ import "strings"
 type NetTool struct {
 	Aliases     []string
 	Spec        Spec
-	Subcommands Set      // egress only on these subcommands (svn, hg, docker)
+	Subcommands Set      // egress only on these subcommands (svn, hg)
 	HostFlags   []string // egress only when one of these is given (mysql -h)
 	HostPort    bool     // the operands are HOST PORT, reported as host:port (telnet h 25)
 	Always      bool     // egress even with no operand
@@ -116,8 +116,6 @@ var netTools = []Command{
 		Subcommands: NewSet("checkout", "co", "export", "update", "up", "commit", "ci", "log", "info", "ls", "list", "cat", "switch", "sw", "merge", "diff", "import"), Kind: "repo", Action: "access"},
 	NetTool{Aliases: names("hg"), Spec: Spec{Subcommand: true, ValueFlags: NewSet("-r", "--rev", "-b", "--branch", "-R", "--repository", "--config")},
 		Subcommands: NewSet("clone", "pull", "push", "incoming", "in", "outgoing", "out", "identify", "id"), Kind: "repo", Action: "access"},
-	NetTool{Aliases: names("docker", "podman", "nerdctl"), Spec: Spec{Subcommand: true, ValueFlags: NewSet("-H", "--host", "--context", "-c", "-l", "--log-level")},
-		Subcommands: NewSet("pull", "push", "login", "logout", "search", "build", "run", "create", "manifest", "buildx", "compose"), Kind: "image", Action: "access"},
 	// DB clients: local socket unless a host is given
 	NetTool{Aliases: names("mysql", "mariadb", "mysqldump", "mysqladmin"), Spec: Spec{ValueFlags: NewSet("-h", "--host", "-P", "--port", "-u", "--user", "-p", "--password", "-e", "--execute", "-S", "--socket")},
 		HostFlags: []string{"-h", "--host"}, Kind: "database", Secrets: []string{"-p", "--password"}},

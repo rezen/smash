@@ -155,6 +155,51 @@ func TestSSHPerlAndPythonParams(t *testing.T) {
 	}
 }
 
+func TestDockerParams(t *testing.T) {
+	p := Parse([]string{"docker", "--context", "remote", "run", "--name", "web", "--rm",
+		"alpine:3.20", "sh", "-c", "echo hi"})
+	d, ok := p.TypedParams().(DockerParams)
+	if !ok {
+		t.Fatalf("TypedParams() = %T, want DockerParams", p.TypedParams())
+	}
+	if d.Name != "docker" || d.Context != "remote" || d.Subcommand != "run" || d.Image != "alpine:3.20" {
+		t.Errorf("fields wrong: %+v", d)
+	}
+	if got, want := strings.Join(d.Rest, " "), "--name web --rm"; got != want {
+		t.Errorf("Rest = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(d.Arguments, " "), "sh -c echo hi"; got != want {
+		t.Errorf("Arguments = %q, want %q", got, want)
+	}
+	if got, want := d.String(), "docker --context remote run --name web --rm alpine:3.20 sh -c 'echo hi'"; got != want {
+		t.Errorf("String() = %q, want %q", got, want)
+	}
+
+	// The compatible CLI spelling survives a typed round trip.
+	podman := Parse([]string{"podman", "pull", "quay.io/acme/app:latest"}).TypedParams().(DockerParams)
+	if got, want := podman.String(), "podman pull quay.io/acme/app:latest"; got != want {
+		t.Errorf("Podman String() = %q, want %q", got, want)
+	}
+
+	// A value-taking run flag must not become the image, and flags for the
+	// command inside the container must remain trailing arguments.
+	run := Parse([]string{"nerdctl", "run", "-p", "8080:80", "nginx", "nginx", "-g", "daemon off;"}).TypedParams().(DockerParams)
+	if run.Image != "nginx" || strings.Join(run.Arguments, " ") != "nginx -g daemon off;" {
+		t.Errorf("Nerdctl run params wrong: %+v", run)
+	}
+
+	// Global short options are typed, while the same spelling after `run`
+	// remains a subcommand-specific option.
+	global := Parse([]string{"docker", "-c", "remote", "ps"}).TypedParams().(DockerParams)
+	if global.Context != "remote" || len(global.Rest) != 0 {
+		t.Errorf("global -c params wrong: %+v", global)
+	}
+	cpu := Parse([]string{"docker", "run", "-c", "512", "alpine"}).TypedParams().(DockerParams)
+	if cpu.Context != "" || strings.Join(cpu.Rest, " ") != "-c 512" || cpu.Image != "alpine" {
+		t.Errorf("run -c params wrong: %+v", cpu)
+	}
+}
+
 func TestBase64Params(t *testing.T) {
 	p := Parse([]string{"base64", "-di", "-w", "0", "payload.b64"})
 	b, ok := p.TypedParams().(Base64Params)
