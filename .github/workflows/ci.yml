@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      # third_party/sh is a build product (gitignored): the pinned mvdan.cc/sh
+      # module trimmed and patched by tools/sync-sh.sh. A fresh clone does not
+      # build until it exists. Call the script directly: `go generate ./...`
+      # cannot reach the directive in cmd/smash because package loading fails
+      # while the replace target is missing.
+      - name: Generate third_party/sh
+        run: sh tools/sync-sh.sh
+
+      - name: Check formatting
+        run: |
+          out=$(gofmt -l $(git ls-files '*.go'))
+          if [ -n "$out" ]; then
+            echo "files need gofmt:" >&2
+            echo "$out" >&2
+            exit 1
+          fi
+
+      - name: Check go.mod / go.sum are tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test -count=1 ./...
+
+  # Blocking. The interpreter runs pipeline stages and backgrounded commands on
+  # their own goroutines, and each one writes an audit record and copies its
+  # streams, so a race here is a corrupt audit log rather than a test artefact.
+  race:
+    name: race detector
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Generate third_party/sh
+        run: sh tools/sync-sh.sh
+
+      - name: Test with -race
+        run: go test -race -count=1 ./...
+
+  cross-compile:
+    name: cross-compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Generate third_party/sh
+        run: sh tools/sync-sh.sh
+
+      - name: Build every release target
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            echo "== $target"
+            GOOS=${target%/*} GOARCH=${target#*/} go build -o /dev/null ./cmd/smash
+          done
