@@ -1,0 +1,425 @@
+--- a/interp/api.go
++++ b/interp/api.go
+@@ -104,6 +104,13 @@
+ 	stdout io.Writer
+ 	stderr io.Writer
+ 
++	// smash patch: file descriptors other than 0/1/2, opened or duplicated by
++	// redirections such as `3>/dev/null`, `exec 3>&1`, `1>&4`, `<&3`. They are
++	// visible to the shell itself (builtins, functions, subshells) but are not
++	// passed to exec'd commands. See PATCH.md.
++	extraOut map[string]io.Writer
++	extraIn  map[string]stdinFile
++
+ 	ecfg *expand.Config
+ 	ectx context.Context // just so that Runner.Subshell can use it again
+ 
+@@ -693,6 +700,7 @@
+ 	// sorted alphabetically by name
+ 	{'a', "allexport"},
+ 	{'e', "errexit"},
++	{'C', "noclobber"}, // smash patch
+ 	{'n', "noexec"},
+ 	{'f', "noglob"},
+ 	{'u', "nounset"},
+@@ -822,13 +830,14 @@
+ 	// These correspond to indexes in [shellOptsTable]
+ 	optAllExport = iota
+ 	optErrExit
++	optNoClobber // smash patch
+ 	optNoExec
+ 	optNoGlob
+ 	optNoUnset
+ 	optXTrace
+ 	optPipeFail
+ 
+-	// These correspond to indexes (offset by the above seven items) of
++	// These correspond to indexes (offset by the above eight items) of
+ 	// supported options in [bashOptsTable]
+ 	optDotGlob
+ 	optExpandAliases
+@@ -1094,6 +1103,8 @@
+ 	// Funcs are copied, since they might be modified.
+ 	r2.Funcs = maps.Clone(r.Funcs)
+ 	r2.Vars = make(map[string]expand.Variable)
++	r2.extraOut = maps.Clone(r.extraOut)
++	r2.extraIn = maps.Clone(r.extraIn)
+ 	r2.alias = maps.Clone(r.alias)
+ 
+ 	r2.dirStack = append(r2.dirBootstrap[:0], r.dirStack...)
+--- a/interp/runner.go
++++ b/interp/runner.go
+@@ -12,6 +12,7 @@
+ 	"io"
+ 	"io/fs"
+ 	"iter"
++	"maps"
+ 	"math"
+ 	mathrand "math/rand/v2"
+ 	"os"
+@@ -335,6 +336,7 @@
+ 
+ func (r *Runner) stmtSync(ctx context.Context, st *syntax.Stmt) {
+ 	oldIn, oldOut, oldErr := r.stdin, r.stdout, r.stderr
++	oldExtraIn, oldExtraOut := maps.Clone(r.extraIn), maps.Clone(r.extraOut)
+ 	var closers []io.Closer
+ 	for _, rd := range st.Redirs {
+ 		cls, err := r.redir(ctx, rd)
+@@ -360,6 +362,13 @@
+ 			r.exit.clear()
+ 		}
+ 	} else if b, ok := st.Cmd.(*syntax.BinaryCmd); ok && (b.Op == syntax.AndStmt || b.Op == syntax.OrStmt) {
++	} else if isBodyCompound(st.Cmd) {
++		// smash patch: a compound command's own status is that of the last
++		// statement in its body, and that statement already decided whether
++		// to trigger errexit — so an exempt failure there (`! f && warn`
++		// inside an if body) must not be re-judged here. bash agrees; it does
++		// still exit on a failing function call or subshell, which are not
++		// in this set.
+ 	} else if !r.exit.ok() && !r.noErrExit {
+ 		r.trapCallback(ctx, r.callbackErr, "error")
+ 		// If the "errexit" option is set and a command failed, exit the shell. Exceptions:
+@@ -367,6 +376,7 @@
+ 		//   conditions (if <cond>, while <cond>, etc)
+ 		//   part of && or || lists; excluded via "else" above
+ 		//   preceded by !; excluded via "else" above
++		//   compound bodies (if/{ }/for/while/case); excluded via "else" above
+ 		if r.opts[optErrExit] {
+ 			r.exit.exiting = true
+ 		}
+@@ -377,12 +387,25 @@
+ 		r.keepRedirs = false
+ 	} else if len(st.Redirs) > 0 {
+ 		r.stdin, r.stdout, r.stderr = oldIn, oldOut, oldErr
++		r.extraIn, r.extraOut = oldExtraIn, oldExtraOut
+ 		for _, cls := range closers {
+ 			cls.Close()
+ 		}
+ 	}
+ }
+ 
++// isBodyCompound reports whether cm is a compound command whose exit status is
++// simply that of the last statement run in its body (if/then, { }, for, while,
++// case) — as opposed to a subshell or a function call, which bash treats as a
++// command in its own right for errexit.
++func isBodyCompound(cm syntax.Command) bool {
++	switch cm.(type) {
++	case *syntax.IfClause, *syntax.Block, *syntax.ForClause, *syntax.WhileClause, *syntax.CaseClause:
++		return true
++	}
++	return false
++}
++
+ func (r *Runner) cmd(ctx context.Context, cm syntax.Command) {
+ 	if r.stop(ctx) {
+ 		return
+@@ -1042,18 +1065,13 @@
+ 		return pr, nil
+ 	}
+ 
+-	orig := &r.stdout
++	// smash patch: any numeric fd is accepted; 0/1/2 are the runner's
++	// stdin/stdout/stderr and the rest live in extraIn/extraOut.
++	fd := "1"
+ 	if rd.N != nil {
+-		switch rd.N.Value {
+-		case "0":
+-			// Note that the input redirects below always use stdin (0)
+-			// because we don't support anything else right now.
+-		case "1":
+-			// The default for the output redirects below.
+-		case "2":
+-			orig = &r.stderr
+-		default:
+-			return nil, fmt.Errorf("unsupported redirect fd: %v", rd.N.Value)
++		fd = rd.N.Value
++		if _, err := strconv.Atoi(fd); err != nil {
++			return nil, fmt.Errorf("unsupported redirect fd: %v", fd)
+ 		}
+ 	}
+ 	arg := r.literal(rd.Word)
+@@ -1073,27 +1091,32 @@
+ 		}()
+ 		return pr, nil
+ 	case syntax.DplOut:
+-		switch arg {
+-		case "1":
+-			*orig = r.stdout
+-		case "2":
+-			*orig = r.stderr
+-		case "-":
+-			*orig = io.Discard // closing the output writer
+-		default:
+-			return nil, fmt.Errorf("unhandled %v arg: %q", rd.Op, arg)
++		if arg == "-" { // closing the output writer
++			r.setOut(fd, io.Discard)
++			return nil, nil
+ 		}
++		w, ok := r.getOut(arg)
++		if !ok {
++			return nil, fmt.Errorf("%s: Bad file descriptor", arg)
++		}
++		r.setOut(fd, w)
+ 		return nil, nil
+ 	case syntax.RdrIn, syntax.RdrOut, syntax.AppOut,
+-		syntax.RdrAll, syntax.AppAll:
++		syntax.RdrAll, syntax.AppAll, syntax.ClbOut:
+ 		// done further below
+ 	case syntax.DplIn:
+-		switch arg {
+-		case "-":
+-			r.stdin = nil // closing the input file
+-		default:
+-			return nil, fmt.Errorf("unhandled %v arg: %q", rd.Op, arg)
++		if fd == "1" { // no explicit fd: `<&N` reads into stdin
++			fd = "0"
++		}
++		if arg == "-" { // closing the input file
++			r.setIn(fd, nil)
++			return nil, nil
+ 		}
++		in, ok := r.getIn(arg)
++		if !ok {
++			return nil, fmt.Errorf("%s: Bad file descriptor", arg)
++		}
++		r.setIn(fd, in)
+ 		return nil, nil
+ 	default:
+ 		return nil, fmt.Errorf("unhandled redirect op: %v", rd.Op)
+@@ -1102,11 +1125,19 @@
+ 	switch rd.Op {
+ 	case syntax.AppOut, syntax.AppAll:
+ 		mode = os.O_WRONLY | os.O_CREATE | os.O_APPEND
++	case syntax.ClbOut: // smash patch: `>|` always clobbers
++		mode = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+ 	case syntax.RdrOut, syntax.RdrAll:
+ 		mode = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
++		if r.opts[optNoClobber] { // smash patch: `set -C`/`set -o noclobber`
++			mode = os.O_WRONLY | os.O_CREATE | os.O_EXCL
++		}
+ 	}
+ 	f, err := r.open(ctx, arg, mode, 0o644, false)
+ 	if err != nil {
++		if mode&os.O_EXCL != 0 && errors.Is(err, fs.ErrExist) {
++			return nil, fmt.Errorf("%s: cannot overwrite existing file", arg)
++		}
+ 		return nil, err
+ 	}
+ 	switch rd.Op {
+@@ -1115,9 +1146,12 @@
+ 		if err != nil {
+ 			return nil, err
+ 		}
+-		r.stdin = stdin
+-	case syntax.RdrOut, syntax.AppOut:
+-		*orig = f
++		if fd == "1" { // no explicit fd: `<file` reads into stdin
++			fd = "0"
++		}
++		r.setIn(fd, stdin)
++	case syntax.RdrOut, syntax.AppOut, syntax.ClbOut:
++		r.setOut(fd, f)
+ 	case syntax.RdrAll, syntax.AppAll:
+ 		r.stdout = f
+ 		r.stderr = f
+@@ -1234,3 +1268,49 @@
+ 	path := absPath(r.Dir, name)
+ 	return r.accessHandler(r.handlerCtx(ctx, handlerKindAccess, todoPos), path, mode)
+ }
++
++// smash patch: the shell's descriptor table beyond 0/1/2.
++
++func (r *Runner) getOut(fd string) (io.Writer, bool) {
++	switch fd {
++	case "1":
++		return r.stdout, true
++	case "2":
++		return r.stderr, true
++	}
++	w, ok := r.extraOut[fd]
++	return w, ok
++}
++
++func (r *Runner) setOut(fd string, w io.Writer) {
++	switch fd {
++	case "0", "1": // `0>file` is nonsense; keep the old behaviour of using stdout
++		r.stdout = w
++	case "2":
++		r.stderr = w
++	default:
++		if r.extraOut == nil {
++			r.extraOut = map[string]io.Writer{}
++		}
++		r.extraOut[fd] = w
++	}
++}
++
++func (r *Runner) getIn(fd string) (stdinFile, bool) {
++	if fd == "0" {
++		return r.stdin, true
++	}
++	in, ok := r.extraIn[fd]
++	return in, ok
++}
++
++func (r *Runner) setIn(fd string, in stdinFile) {
++	if fd == "0" {
++		r.stdin = in
++		return
++	}
++	if r.extraIn == nil {
++		r.extraIn = map[string]stdinFile{}
++	}
++	r.extraIn[fd] = in
++}
+--- a/interp/test.go
++++ b/interp/test.go
+@@ -44,6 +44,22 @@
+ 				}
+ 			}
+ 			return ""
++		case syntax.AndTest, syntax.OrTest:
++			// smash patch: && and || short-circuit inside [[ ]] like bash,
++			// so the right operand is neither expanded nor evaluated when
++			// the left one already decides the result. Under `set -u`
++			// that keeps `[[ $# = 2 && $2 = x ]]` from tripping nounset.
++			left := r.bashTest(ctx, x.X, classic) != ""
++			if left != (x.Op == syntax.AndTest) {
++				if left {
++					return "1"
++				}
++				return ""
++			}
++			if r.bashTest(ctx, x.Y, classic) != "" {
++				return "1"
++			}
++			return ""
+ 		}
+ 		if r.binTest(ctx, x.Op, r.bashTest(ctx, x.X, classic), r.bashTest(ctx, x.Y, classic)) {
+ 			return "1"
+--- a/expand/param.go
++++ b/expand/param.go
+@@ -145,6 +145,46 @@
+ 		elems = []string{str}
+ 	}
+ 
++	// smash patch: a plain indirection ${!name…} re-targets the expansion to
++	// the variable named by $name, so the operators after it apply to that
++	// target as in bash: bun's `${!install_env:-$HOME/.bun}` must fall back
++	// to the default when $BUN_INSTALL is unset, and `set -u` must object to
++	// an unset target. Upstream returned the target's value and ignored the
++	// operator. ${!prefix*}, ${!arr[@]} and namerefs keep their own meaning
++	// in the switch below.
++	indirect := pe.Excl && pe.Names == 0 && orig.Kind != NameRef &&
++		!(pe.Index != nil && (vr.Kind == Indexed || vr.Kind == Associative))
++	if indirect {
++		if !set && pe.Exp == nil {
++			return "", fmt.Errorf("invalid indirect expansion")
++		}
++		name, index = str, nil
++		if i := strings.IndexByte(name, '['); i > 0 && strings.HasSuffix(name, "]") {
++			index = &syntax.Word{Parts: []syntax.WordPart{
++				&syntax.Lit{Value: name[i+1 : len(name)-1]},
++			}}
++			name = name[:i]
++		}
++		vr = Variable{}
++		if name != "" {
++			vr = cfg.Env.Get(name)
++			if n, v := vr.Resolve(cfg.Env); n != "" {
++				name, vr = n, v
++			}
++		}
++		var err error
++		if str, set, err = cfg.varInd(vr, index); err != nil {
++			return "", err
++		}
++		if cfg.NoUnset && !set && !overridingUnset(pe) {
++			return "", UnsetParameterError{
++				Node:    pe,
++				Message: "unbound variable",
++			}
++		}
++		elems = []string{str}
++	}
++
+ 	switch {
+ 	case pe.Length:
+ 		n := len(elems)
+@@ -154,7 +194,7 @@
+ 			n = utf8.RuneCountInString(str)
+ 		}
+ 		str = strconv.Itoa(n)
+-	case pe.Excl:
++	case pe.Excl && !indirect: // smash patch: plain indirection handled above
+ 		var strs []string
+ 		switch {
+ 		case pe.Names != 0:
+@@ -208,11 +248,30 @@
+ 		}
+ 		str = join(elems)
+ 	case pe.Exp != nil:
+-		arg, err := Literal(cfg, pe.Exp.Word)
+-		if err != nil {
+-			return "", err
++		// smash patch: bash expands the word of ${v-w}, ${v+w}, ${v?w}, ${v=w}
++		// and their ":" variants only when it is used, so an unset variable
++		// inside an unused word — ollama's "${OLLAMA_VERSION:+?version=$OLLAMA_VERSION}"
++		// under set -u — must not trip nounset. Upstream expands it eagerly.
++		op := pe.Exp.Op
++		used := true
++		switch op {
++		case syntax.AlternateUnset:
++			used = set
++		case syntax.AlternateUnsetOrNull:
++			used = set && str != ""
++		case syntax.DefaultUnset, syntax.ErrorUnset, syntax.AssignUnset:
++			used = !set
++		case syntax.DefaultUnsetOrNull, syntax.ErrorUnsetOrNull, syntax.AssignUnsetOrNull:
++			used = str == ""
+ 		}
+-		switch op := pe.Exp.Op; op {
++		var arg string
++		var err error
++		if used {
++			if arg, err = Literal(cfg, pe.Exp.Word); err != nil {
++				return "", err
++			}
++		}
++		switch op {
+ 		case syntax.AlternateUnsetOrNull:
+ 			if str == "" {
+ 				break
+@@ -356,17 +415,24 @@
+ 	case pe.Repl != nil:
+ 		return cfg.replaceElems(pe.Repl, elems)
+ 	case pe.Exp != nil:
+-		arg, err := Literal(cfg, pe.Exp.Word)
+-		if err != nil {
+-			return nil, err
+-		}
++		// smash patch: only the pattern and case operators use the word
++		// here; expanding it for the others would trip nounset on an unset
++		// variable in a word bash never evaluates.
+ 		switch op := pe.Exp.Op; op {
+ 		case syntax.RemSmallPrefix, syntax.RemLargePrefix,
+-			syntax.RemSmallSuffix, syntax.RemLargeSuffix:
+-			return cfg.removePatternElems(op, arg, elems), nil
+-		case syntax.UpperFirst, syntax.UpperAll,
++			syntax.RemSmallSuffix, syntax.RemLargeSuffix,
++			syntax.UpperFirst, syntax.UpperAll,
+ 			syntax.LowerFirst, syntax.LowerAll:
+-			return cfg.caseConvElems(op, arg, elems), nil
++			arg, err := Literal(cfg, pe.Exp.Word)
++			if err != nil {
++				return nil, err
++			}
++			switch op {
++			case syntax.UpperFirst, syntax.UpperAll,
++				syntax.LowerFirst, syntax.LowerAll:
++				return cfg.caseConvElems(op, arg, elems), nil
++			}
++			return cfg.removePatternElems(op, arg, elems), nil
+ 		}
+ 	}
+ 	return elems, nil

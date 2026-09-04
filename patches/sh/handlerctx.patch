@@ -1,0 +1,21 @@
+--- a/interp/handler.go
++++ b/interp/handler.go
+@@ -33,6 +33,18 @@
+ }
+ 
+ type handlerCtxKey struct{}
++
++// WithHandlerContext returns a copy of ctx carrying hc, so that a caller
++// wrapping a handler can pass the next one a modified [HandlerContext] —
++// substituting the streams in order to tee them, for instance. [HandlerCtx] on
++// the returned context reports hc.
++//
++// smash patch: middleware that captures what a command reads and writes has to
++// hand the inner handler replaced streams, and the key those travel under is
++// unexported, so there is no way to do it from outside this package.
++func WithHandlerContext(ctx context.Context, hc HandlerContext) context.Context {
++	return context.WithValue(ctx, handlerCtxKey{}, hc)
++}
+ 
+ type handlerKind int
+ 

@@ -1,0 +1,15 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    ignore:
+      # Bumping mvdan.cc/sh needs patches/sh/smash.patch re-based by hand
+      # (see patches/sh/README.md), so an automated PR would only ever fail CI.
+      - dependency-name: mvdan.cc/sh/v3
