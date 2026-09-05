@@ -13,7 +13,10 @@ and sensitive-command list. Its fields can then be widened or replaced:
 cfg := sandbox.NewConfig(root, home, env)
 cfg.Allowed = cfg.Allowed.With("python3")
 cfg.Strict = true
+cfg.AllowInRootExecutables = false
 cfg.Network.AllowedPrefixes = []string{"https://internal.example/"}
+cfg.Network.MaxRequest = 8 << 20
+cfg.Network.DNSServer = "1.1.1.2:53" // empty uses the system resolver
 cfg.Network.InjectHeaders = map[string]string{
 	"Authorization": "Bearer …",
 }
@@ -28,6 +31,20 @@ cfg.Auditor = sandbox.TextAuditor(os.Stderr)
 cfg.AuditData = 4096
 
 err := sandbox.Run(cfg, "install.sh", script)
+```
+
+Terminal frontends may set `cfg.ControllingTTY` to their script-side PTY. This
+routes shell `/dev/tty` redirections to that PTY and lets terminal-facing child
+processes acquire it as their controlling terminal. Ordinary embedders can
+leave the field nil.
+
+Call `RunContext` when an embedding application needs to cancel a run, as the
+interactive CLI does for `Ctrl-C`. `Config.Timeout` remains an upper bound:
+
+```go
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+err := sandbox.RunContext(ctx, cfg, "install.sh", script)
 ```
 
 The caller is responsible for preparing the root, home, environment, script

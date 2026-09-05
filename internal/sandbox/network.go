@@ -1,8 +1,8 @@
 package sandbox
 
-// The in-process network layer. curl/wget are not delegated to host binaries
-// (which can reach any URL): httpMiddleware intercepts every command.Downloader,
-// takes its parsed Request, and drives a configurable net/http.Client. That
+// Network policy and egress enforcement. curl/wget are not delegated to host
+// binaries (which can reach any URL): the tool package takes their parsed
+// Request and drives a configurable net/http.Client. That
 // moves the boundary in-process — the allow-list, redirect policy, timeout,
 // size cap, header injection and transport (proxy/TLS/DNS) are all enforced
 // here. Other network-capable commands (openssl s_client, ssh, nc, git clone)
@@ -11,14 +11,12 @@ package sandbox
 import (
 	"context"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -27,6 +25,7 @@ import (
 	"mvdan.cc/sh/v3/interp"
 
 	"github.com/rezen/smash/internal/command"
+	"github.com/rezen/smash/internal/tool"
 )
 
 // Policy is the network policy: what a sandboxed fetch may reach and how.
@@ -42,16 +41,26 @@ type Policy struct {
 	// covered by its parent. Use Validate to reject entries that are not URL
 	// prefixes at all — those match nothing. See Allows.
 	AllowedPrefixes []string
-	AllowedMethods  map[string]bool // HTTP methods a downloader may use
-	MaxResponse     int64           // response body cap in bytes
-	Timeout         time.Duration   // per-request timeout
+	// AllowedHosts grants every HTTP(S) URL on an exact host. It is primarily
+	// used by a generated profile manifest, whose contract records hosts rather
+	// than paths. Unlike GitHosts, parent hosts do not grant subdomains.
+	AllowedHosts   []string
+	AllowedMethods map[string]bool // HTTP methods a downloader may use
+	MaxResponse    int64           // response body cap in bytes
+	MaxRequest     int64           // request body cap in bytes
+	Timeout        time.Duration   // per-request timeout
+	// DNSServer is the IP[:port] used by the in-process HTTP client. Empty uses
+	// the host's system resolver. DefaultPolicy selects a malware-blocking DNS.
+	DNSServer string
 	// InjectHeaders are added to every request (e.g. a broker token) so secrets
 	// never have to appear in the sandboxed script itself.
 	InjectHeaders map[string]string
-	// GitHosts are the hosts git may clone/fetch/push to, over any transport
+	// GitHosts are advisory checks for an explicitly allowed real git process.
+	// They are the hosts git may clone/fetch/push to, over any transport
 	// (https, ssh, git://, scp-like user@host:path); a subdomain of a listed
 	// host counts. Git is not a downloader, so it bypasses the in-process HTTP
-	// client — this is the only gate on where it talks to. See AllowsGit.
+	// client. These checks are defense in depth for explicitly granted real
+	// Git, not an OS-level egress boundary. See AllowsGit.
 	GitHosts []string
 }
 
@@ -90,7 +99,9 @@ func DefaultPolicy() Policy {
 		},
 		AllowedMethods: map[string]bool{"GET": true, "HEAD": true},
 		MaxResponse:    200 << 20, // 200 MiB
+		MaxRequest:     8 << 20,   // 8 MiB
 		Timeout:        60 * time.Second,
+		DNSServer:      DefaultDNSServer,
 		GitHosts:       DefaultGitHosts(),
 	}
 }
@@ -111,6 +122,12 @@ func (p Policy) Allows(u *url.URL) bool {
 	if u == nil || u.User != nil || hasDotSegment(u.Path) {
 		return false
 	}
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	for _, allowed := range p.AllowedHosts {
+		if host == strings.ToLower(strings.TrimSuffix(allowed, ".")) {
+			return true
+		}
+	}
 	for _, pre := range p.AllowedPrefixes {
 		if r, ok := parseURLRule(pre); ok && r.allows(u) {
 			return true
@@ -119,20 +136,45 @@ func (p Policy) Allows(u *url.URL) bool {
 	return false
 }
 
-// AllowsTarget permits only allow-listed URLs; a raw host:port (openssl/ssh/nc)
-// is not a URL, so it is denied.
+// AllowsTarget permits allow-listed URLs and raw endpoints whose host appears
+// in AllowedHosts.
 func (p Policy) AllowsTarget(target string) bool {
-	if !strings.Contains(target, "://") {
-		return false
+	if strings.Contains(target, "://") {
+		u, err := url.Parse(target)
+		return err == nil && p.Allows(u)
 	}
-	u, err := url.Parse(target)
-	return err == nil && p.Allows(u)
+	host := endpointHost(target)
+	for _, allowed := range p.AllowedHosts {
+		if host == strings.ToLower(strings.TrimSuffix(allowed, ".")) {
+			return true
+		}
+	}
+	return false
 }
 
-// Validate reports the AllowedPrefixes entries that are not URL prefixes at
-// all — "example.com/x" with no scheme, say. Such an entry matches nothing, so
-// a mistyped policy fails closed, which is safe but silent: a caller taking
-// the list from a user (the CLI does) should surface it instead.
+func endpointHost(target string) string {
+	rest := target
+	if i := strings.IndexByte(rest, '@'); i >= 0 {
+		rest = rest[i+1:]
+	}
+	if h := strings.Trim(rest, "[]"); net.ParseIP(h) != nil {
+		return strings.ToLower(h)
+	}
+	if h, _, err := net.SplitHostPort(rest); err == nil {
+		return strings.ToLower(strings.TrimSuffix(h, "."))
+	}
+	if h, _, ok := strings.Cut(rest, ":"); ok {
+		rest = h
+	}
+	if strings.ContainsAny(rest, "/ ") {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSuffix(strings.Trim(rest, "[]"), "."))
+}
+
+// Validate reports malformed URL prefixes and DNS resolver endpoints. A
+// mistyped policy otherwise fails closed but silently, so callers taking the
+// policy from a user should surface the error before starting a run.
 func (p Policy) Validate() error {
 	var bad []string
 	for _, pre := range p.AllowedPrefixes {
@@ -140,10 +182,15 @@ func (p Policy) Validate() error {
 			bad = append(bad, strconv.Quote(pre))
 		}
 	}
-	if len(bad) == 0 {
-		return nil
+	if len(bad) > 0 {
+		return fmt.Errorf("URL allow-list needs a scheme on every entry (e.g. https://host/path); cannot use %s", strings.Join(bad, ", "))
 	}
-	return fmt.Errorf("URL allow-list needs a scheme on every entry (e.g. https://host/path); cannot use %s", strings.Join(bad, ", "))
+	for _, host := range p.AllowedHosts {
+		if host == "" || strings.ContainsAny(host, "/@ \\") || strings.Contains(host, ":") && net.ParseIP(host) == nil {
+			return fmt.Errorf("invalid allowed host %q", host)
+		}
+	}
+	return ValidateDNSServer(p.DNSServer)
 }
 
 // urlRule is one parsed AllowedPrefixes entry. Entries are parsed on every
@@ -260,212 +307,39 @@ func gitTargetHost(target string) string {
 // client builds the http.Client with the policy applied. Everything you'd
 // normally reach for on a client — Timeout, CheckRedirect, Transport
 // (Proxy/TLSClientConfig/DialContext) — is wired here.
-func (p Policy) client() *http.Client {
-	return &http.Client{
-		Timeout: p.Timeout,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 20 {
-				return fmt.Errorf("stopped after 20 redirects")
-			}
-			if !p.Allows(req.URL) { // re-check the allow-list on every hop
-				return fmt.Errorf("redirect to disallowed URL: %s", req.URL)
-			}
-			return nil
-		},
-		Transport: &http.Transport{
-			Proxy:             http.ProxyFromEnvironment,
-			DialContext:       (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
-			ForceAttemptHTTP2: true,
-			// TLSClientConfig: &tls.Config{...} // pin certs / min version here
-		},
+func (p Policy) client() (*http.Client, error) {
+	client, err := NewHTTPClient(p.Timeout, p.DNSServer)
+	if err != nil {
+		return nil, err
 	}
-}
-
-// httpMiddleware serves every command.Downloader in-process; everything else
-// falls through to next. root is the sandbox root that a fetch may write into
-// (see outputSink); "" leaves the write unconfined.
-func httpMiddleware(p Policy, root string) Middleware {
-	client := p.client()
-	return func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
-		return func(ctx context.Context, args []string) error {
-			if len(args) == 0 {
-				return next(ctx, args)
-			}
-			d, ok := command.Lookup(args[0]).(command.Downloader)
-			if !ok {
-				return next(ctx, args)
-			}
-			parsed := command.Parse(args)
-			tool := filepath.Base(args[0])
-			// A Request carries one URL, but curl takes several and pairs them
-			// with successive -o names. Serving only the first would fetch part
-			// of what was asked for and say nothing about the rest, so refuse
-			// the whole invocation and name what was dropped.
-			if urls := urlOperands(parsed); len(urls) > 1 {
-				return failf(interp.HandlerCtx(ctx).Stderr, 2,
-					"%s: [sandbox] one URL per invocation, got %d: %s", tool, len(urls), strings.Join(urls, " "))
-			}
-			return runDownloader(ctx, client, p, root, tool, d.Request(parsed))
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 20 {
+			return fmt.Errorf("stopped after 20 redirects")
 		}
-	}
-}
-
-// urlOperands lists the operands that carry a scheme, i.e. the URLs a fetcher
-// was asked for. Operands without one (a bare host, a stray value) are left
-// out: the downloader's own parse decides what those mean.
-func urlOperands(p command.ParsedCommand) []string {
-	var urls []string
-	for _, o := range p.Operands {
-		if strings.Contains(o, "://") {
-			urls = append(urls, o)
+		if !p.Allows(req.URL) { // re-check the allow-list on every hop
+			return fmt.Errorf("redirect to disallowed URL: %s", req.URL)
 		}
+		return nil
 	}
-	return urls
+	return client, nil
 }
 
-// runDownloader performs one fetch under the policy, emulating the tool's exit
-// codes (curl's: 2 usage, 3 bad URL, 6 unresolvable, 7 connect, 22 HTTP, 23 write).
-func runDownloader(ctx context.Context, client *http.Client, p Policy, root, tool string, req command.Request) error {
-	hc := interp.HandlerCtx(ctx)
-	if req.URL == "" {
-		return failf(hc.Stderr, 2, "%s: no URL specified", tool)
-	}
-	u, err := url.Parse(req.URL)
+// httpMiddleware supplies sandbox policy to the in-process curl/wget tools.
+func httpMiddleware(p Policy, root string) (Middleware, error) {
+	client, err := p.client()
 	if err != nil {
-		return failf(hc.Stderr, 3, "%s: bad URL %q: %v", tool, req.URL, err)
+		return nil, err
 	}
-	if !p.Allows(u) {
-		return failf(hc.Stderr, 6, "%s: [sandbox] URL not in allow-list: %s", tool, u)
-	}
-	method := req.Method
-	if method == "" {
-		method = "GET"
-	}
-	if req.Head {
-		method = "HEAD"
-	}
-	if !p.AllowedMethods[method] {
-		return failf(hc.Stderr, 6, "%s: [sandbox] method not allowed: %s", tool, method)
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, method, u.String(), nil)
-	if err != nil {
-		return failf(hc.Stderr, 2, "%s: %v", tool, err)
-	}
-	for k, vs := range req.Headers {
-		for _, v := range vs {
-			httpReq.Header.Add(k, v)
-		}
-	}
-	for k, v := range p.InjectHeaders { // policy-injected headers win
-		httpReq.Header.Set(k, v)
-	}
-	if httpReq.Header.Get("User-Agent") == "" {
-		httpReq.Header.Set("User-Agent", tool+"-sandbox")
-	}
-
-	if !req.Follow { // curl without -L returns the 3xx itself
-		c := *client
-		c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-		client = &c
-	}
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		return failf(hc.Stderr, 7, "%s: %v", tool, err)
-	}
-	defer resp.Body.Close()
-	if req.FailOnHTTP && resp.StatusCode >= 400 {
-		return failf(hc.Stderr, 22, "%s: The requested URL returned error: %d", tool, resp.StatusCode)
-	}
-
-	out, err := outputSink(hc, root, req, u)
-	if err != nil {
-		return failf(hc.Stderr, 23, "%s: %v", tool, err)
-	}
-	if req.Head {
-		fmt.Fprintf(out, "%s %s\r\n", resp.Proto, resp.Status)
-		_ = resp.Header.Write(out)
-		return out.Close()
-	}
-	n, err := io.Copy(out, io.LimitReader(resp.Body, p.MaxResponse+1))
-	if cerr := out.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		return failf(hc.Stderr, 23, "%s: %v", tool, err)
-	}
-	if n > p.MaxResponse {
-		return failf(hc.Stderr, 23, "%s: response exceeded %d bytes", tool, p.MaxResponse)
-	}
-	if req.WriteOut != "" {
-		io.WriteString(hc.Stdout, writeOut(req.WriteOut, resp))
-	}
-	return nil
+	return tool.Downloaders(tool.DownloaderConfig{
+		Client:         client,
+		AllowURL:       p.Allows,
+		AllowPath:      func(target string) bool { return root == "" || withinRoot(root, target) },
+		AllowedMethods: p.AllowedMethods,
+		MaxResponse:    p.MaxResponse,
+		MaxRequest:     p.MaxRequest,
+		InjectHeaders:  p.InjectHeaders,
+	}), nil
 }
-
-// writeOut expands the curl -w variables installers use: %{http_code},
-// %{url_effective} (the URL after redirects) and %{redirect_url} (where an
-// unfollowed 3xx points — warp resolves its versioned artifact URL this way
-// instead of letting curl follow the 302). Unknown variables expand empty.
-func writeOut(format string, resp *http.Response) string {
-	return writeOutRE.ReplaceAllStringFunc(format, func(v string) string {
-		switch v {
-		case "%{http_code}", "%{response_code}":
-			return strconv.Itoa(resp.StatusCode)
-		case "%{url_effective}":
-			return resp.Request.URL.String()
-		case "%{redirect_url}":
-			if loc, err := resp.Location(); err == nil && resp.StatusCode/100 == 3 {
-				return loc.String() // resolved against the request URL, as curl does
-			}
-			return ""
-		case "%{content_type}":
-			return resp.Header.Get("Content-Type")
-		case "%{size_download}":
-			return strconv.FormatInt(resp.ContentLength, 10)
-		}
-		return ""
-	})
-}
-
-var writeOutRE = regexp.MustCompile(`%\{[a-z_]+\}`)
-
-// outputSink picks where the body goes: -o FILE, -O remote-name, or stdout.
-// Relative paths resolve against the script's working directory.
-//
-// This is the one write the sandbox performs ITSELF rather than delegating to
-// a host binary, and so the one it can confine: with a root set, a target
-// outside it is refused. Everything else about the filesystem here is
-// convention (HOME and TMPDIR point inside the root); this is not, because
-// `curl -o ~/.zshrc` from an allow-listed URL would otherwise be a write the
-// sandbox carried out on the script's behalf, past every guard it has.
-func outputSink(hc interp.HandlerContext, root string, req command.Request, u *url.URL) (io.WriteCloser, error) {
-	target := req.Output
-	if req.RemoteName && target == "" {
-		target = path.Base(u.Path)
-	}
-	if target == "" || target == "-" {
-		return nopCloser{hc.Stdout}, nil
-	}
-	if !filepath.IsAbs(target) {
-		target = filepath.Join(hc.Dir, target)
-	}
-	if target == os.DevNull { // `curl -o /dev/null` is a fetch with no output
-		return nopCloser{io.Discard}, nil
-	}
-	if root != "" && !withinRoot(root, target) {
-		return nil, fmt.Errorf("[sandbox] refusing to write outside the sandbox root: %s", target)
-	}
-	f, err := os.Create(target)
-	if err != nil {
-		return nil, fmt.Errorf("cannot write %s: %w", target, err)
-	}
-	return f, nil
-}
-
-type nopCloser struct{ io.Writer }
-
-func (nopCloser) Close() error { return nil }
 
 // egressGuardMiddleware denies any network-capable command whose target isn't
 // allow-listed — openssl s_client, ssh, nc, git clone — from ONE place, using

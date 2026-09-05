@@ -170,7 +170,7 @@ func TestPackageManagerEgress(t *testing.T) {
 
 func TestRedact(t *testing.T) {
 	c := Redact(Parse([]string{"curl", "-H", "Authorization: Bearer tok", "-b", "sid=1", "-d", "pw=x", "-A", "ua", "https://x"}).TypedParams()).(CurlParams)
-	if c.Headers[0] != Redacted || c.Cookies[0] != Redacted || c.Data != Redacted || c.UserAgent != "ua" {
+	if c.Headers[0] != Redacted || c.Cookies[0] != Redacted || len(c.Data) != 1 || c.Data[0] != Redacted || c.UserAgent != "ua" {
 		t.Errorf("curl redaction wrong: %+v", c)
 	}
 	if got := c.String(); strings.Contains(got, "tok") || !strings.Contains(got, "-H REDACTED") {

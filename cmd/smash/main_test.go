@@ -3,9 +3,11 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
+	profilemanifest "github.com/rezen/smash/internal/manifest"
 	"github.com/rezen/smash/internal/policy"
 )
 
@@ -163,6 +165,23 @@ func TestPolicyURLsValidated(t *testing.T) {
 	}
 }
 
+func TestDNSServerValidationAndOverride(t *testing.T) {
+	dir := t.TempDir()
+	script := write(t, dir, "s.sh", "true\n")
+	pol := write(t, dir, "policy.yaml", "network:\n  dns-server: not-an-ip\n")
+	if _, err := run(t, dir, "-policy", pol, script); err == nil || !strings.Contains(err.Error(), "DNS server") {
+		t.Errorf("invalid policy DNS server error = %v", err)
+	}
+	// A typed flag wins over the policy. Empty deliberately selects the system
+	// resolver, and is distinct from an absent flag (which keeps the policy).
+	if _, err := run(t, dir, "-policy", pol, "-dns-server", "", script); err != nil {
+		t.Fatalf("empty -dns-server did not override the policy: %v", err)
+	}
+	if _, err := run(t, dir, "-dns-server", "dns.example", script); err == nil || !strings.Contains(err.Error(), "IP literal") {
+		t.Errorf("hostname DNS server error = %v", err)
+	}
+}
+
 func TestPolicyErrors(t *testing.T) {
 	dir := t.TempDir()
 	script := write(t, dir, "s.sh", "true\n")
@@ -180,12 +199,141 @@ func TestPolicyErrors(t *testing.T) {
 	}
 }
 
+func TestProfileManifestAndEnforcedRun(t *testing.T) {
+	dir := t.TempDir()
+	script := write(t, dir, "profile.sh", "set -e\ndf -P / >/dev/null\n/bin/sh -c '/usr/bin/true'\n")
+	pol := write(t, dir, "deny-profile.yaml", "strict: true\ncommands:\n  replace: true\n  disable: [df, sh, true]\n")
+	manifestPath := filepath.Join(dir, "profile.yaml")
+	log, err := run(t, dir, "-policy", pol, "-profile", "-profile-output", manifestPath, script)
+	if err != nil {
+		t.Fatalf("profile run: %v", err)
+	}
+	if strings.Contains(log, "blocked command") || strings.Contains(log, "disabled command") || strings.Contains(log, "unlisted command") {
+		t.Fatalf("profile mode enforced a policy denial:\n%s", log)
+	}
+	m, err := profilemanifest.Load(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(m.Commands, []string{"df", "sh", "true"}) {
+		t.Errorf("profile commands = %v", m.Commands)
+	}
+	if len(m.Hosts) != 0 {
+		t.Errorf("profile hosts = %v", m.Hosts)
+	}
+
+	// The exact script is accepted. df is not on a deliberately empty policy
+	// allow-list, so success also proves the generated command grant is active.
+	log, err = run(t, dir, "-manifest", manifestPath, script)
+	if err != nil {
+		t.Fatalf("manifest run: %v", err)
+	}
+	if strings.Contains(log, "blocked command: df") {
+		t.Fatalf("profiled command was blocked:\n%s", log)
+	}
+
+	if err := os.WriteFile(script, []byte("df -h / >/dev/null\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run(t, dir, "-manifest", manifestPath, script); err == nil || !strings.Contains(err.Error(), "SHA-256 mismatch") {
+		t.Errorf("changed script error = %v", err)
+	}
+}
+
+func TestProfileAndManifestAreExclusive(t *testing.T) {
+	err := runCLI([]string{"-profile", "-manifest", "in.yaml", "script.sh"})
+	if err == nil || !strings.Contains(err.Error(), "cannot be used together") {
+		t.Errorf("error = %v", err)
+	}
+}
+
+func TestProfileFlagTakesTheScriptAsPositionalArgument(t *testing.T) {
+	dir := t.TempDir()
+	script := write(t, dir, "installer.sh", "df -P / >/dev/null\n")
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(old)
+	if _, err := run(t, dir, "-profile", script); err != nil {
+		t.Fatalf("smash -profile SCRIPT: %v", err)
+	}
+	if _, err := profilemanifest.Load(filepath.Join(dir, "installer.manifest.yaml")); err != nil {
+		t.Fatalf("default profile output: %v", err)
+	}
+}
+
+func TestProfileBypassesDownloaderPolicyAndMocks(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeCurl := write(t, bin, "curl", "#!/bin/sh\nexit 0\n")
+	if err := os.Chmod(fakeCurl, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := write(t, dir, "network.sh", "set -e\ncurl https://blocked.example.test/tool\n")
+	pol := write(t, dir, "deny-network.yaml", "strict: true\nenv:\n  PATH: "+bin+"\ncommands:\n  disable: [curl]\nnetwork:\n  urls: []\n  dns-server: not-an-ip\nmocks:\n  - match: {name: [curl]}\n    exit: 9\n")
+	manifestPath := filepath.Join(dir, "network.manifest.yaml")
+	log, err := run(t, dir, "-policy", pol, "-profile", "-profile-output", manifestPath, script)
+	if err != nil {
+		t.Fatalf("unrestricted profile run: %v\n%s", err, log)
+	}
+	if strings.Contains(log, "disabled command") || strings.Contains(log, "URL not in allow-list") || strings.Contains(log, "unlisted command") {
+		t.Fatalf("profile mode enforced policy:\n%s", log)
+	}
+	m, err := profilemanifest.Load(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(m.Commands, []string{"curl"}) || !slices.Equal(m.Hosts, []string{"blocked.example.test"}) {
+		t.Errorf("profile = commands %v, hosts %v", m.Commands, m.Hosts)
+	}
+}
+
+func TestProfileRecordsFailuresAndContinuesPastErrexit(t *testing.T) {
+	dir := t.TempDir()
+	script := write(t, dir, "fail.sh", "set -e\n/usr/bin/false\n/usr/bin/true\n")
+	manifestPath := filepath.Join(dir, "fail.manifest.yaml")
+	log, err := run(t, dir, "-profile", "-profile-output", manifestPath, script)
+	if err != nil {
+		t.Fatalf("profile stopped on an external command failure: %v\n%s", err, log)
+	}
+	if !strings.Contains(log, `name: "false"`) || !strings.Contains(log, "exit: 1") || !strings.Contains(log, `name: "true"`) {
+		t.Fatalf("audit did not retain the failure and later command:\n%s", log)
+	}
+	m, err := profilemanifest.Load(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(m.Commands, []string{"false", "true"}) {
+		t.Errorf("profile commands = %v", m.Commands)
+	}
+}
+
+func TestProfilePreservesFailureInConditions(t *testing.T) {
+	dir := t.TempDir()
+	script := write(t, dir, "condition.sh", "set -e\nif printf safe | grep -Eq '^/'; then\n  exit 42\nfi\n/usr/bin/true\n")
+	manifestPath := filepath.Join(dir, "condition.manifest.yaml")
+	log, err := run(t, dir, "-profile", "-profile-output", manifestPath, script)
+	if err != nil {
+		t.Fatalf("profile changed a false condition to success: %v\n%s", err, log)
+	}
+	if !strings.Contains(log, "name: grep") || !strings.Contains(log, "exit: 1") || !strings.Contains(log, `name: "true"`) {
+		t.Fatalf("conditional status or subsequent discovery is wrong:\n%s", log)
+	}
+}
+
 // TestResetRootRefusesForeignDirectories: -root is emptied on every run, so a
 // mistyped one would recursively delete whatever the path names. Only a
 // missing directory, an empty one, or a previous sandbox may be cleared.
 func TestResetRootRefusesForeignDirectories(t *testing.T) {
 	reset := func(root string) error {
-		return resetRoot(root, filepath.Join(root, "home"), filepath.Join(root, "tmp"))
+		return resetRoot(root)
 	}
 
 	t.Run("missing", func(t *testing.T) {
@@ -198,10 +346,16 @@ func TestResetRootRefusesForeignDirectories(t *testing.T) {
 				t.Errorf("%s not created: %v", d, err)
 			}
 		}
+		if b, err := os.ReadFile(filepath.Join(root, rootMarker)); err != nil || string(b) != rootMarkerContent {
+			t.Errorf("root marker = %q, %v", b, err)
+		}
 	})
 
 	t.Run("previous sandbox is reused", func(t *testing.T) {
-		root := t.TempDir()
+		root := filepath.Join(t.TempDir(), "sandbox")
+		if err := reset(root); err != nil {
+			t.Fatal(err)
+		}
 		stale := filepath.Join(root, "home", "leftover")
 		if err := os.MkdirAll(filepath.Dir(stale), 0o755); err != nil {
 			t.Fatal(err)
@@ -217,6 +371,26 @@ func TestResetRootRefusesForeignDirectories(t *testing.T) {
 		}
 	})
 
+	t.Run("home and tmp are not an ownership proof", func(t *testing.T) {
+		root := t.TempDir()
+		keep := filepath.Join(root, "home", "important")
+		if err := os.MkdirAll(filepath.Dir(keep), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(root, "tmp"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(keep, []byte("keep"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := reset(root); err == nil {
+			t.Fatal("an unmarked directory containing home and tmp must be refused")
+		}
+		if b, err := os.ReadFile(keep); err != nil || string(b) != "keep" {
+			t.Fatalf("unrelated data changed: %q, %v", b, err)
+		}
+	})
+
 	t.Run("someone else's directory is refused", func(t *testing.T) {
 		root := t.TempDir()
 		keep := filepath.Join(root, "main.go")
@@ -227,7 +401,7 @@ func TestResetRootRefusesForeignDirectories(t *testing.T) {
 		if err == nil {
 			t.Fatal("a directory with other contents must not be emptied")
 		}
-		if !strings.Contains(err.Error(), "not a previous sandbox") {
+		if !strings.Contains(err.Error(), "no valid "+rootMarker+" marker") {
 			t.Errorf("unhelpful error: %v", err)
 		}
 		if _, statErr := os.Stat(keep); statErr != nil {
@@ -242,6 +416,31 @@ func TestResetRootRefusesForeignDirectories(t *testing.T) {
 		}
 		if err := reset(root); err == nil {
 			t.Error("a plain file must not be treated as a sandbox root")
+		}
+	})
+
+	t.Run("invalid marker is refused", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.WriteFile(filepath.Join(root, rootMarker), []byte("not smash\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := reset(root); err == nil {
+			t.Fatal("an invalid ownership marker must be refused")
+		}
+	})
+
+	t.Run("root symlink is refused", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "target")
+		if err := os.Mkdir(target, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		root := filepath.Join(dir, "root")
+		if err := os.Symlink(target, root); err != nil {
+			t.Fatal(err)
+		}
+		if err := reset(root); err == nil {
+			t.Fatal("a root symlink must be refused")
 		}
 	})
 }

@@ -178,18 +178,31 @@ func (t TransferTool) Resources(p ParsedCommand) []Resource { return changeResou
 // Mktemp creates a temp file or directory (-d) from a template.
 type Mktemp struct{}
 
-var mktempSpec = Spec{ValueFlags: NewSet("-p", "--tmpdir", "--suffix")}
+var mktempSpec = Spec{ClusterShort: true, ValueFlags: NewSet("-p", "--tmpdir", "-t", "--suffix")}
 
 func (Mktemp) Names() []string                { return []string{"mktemp"} }
 func (Mktemp) Parse(a []string) ParsedCommand { return mktempSpec.Parse(a) }
 func (Mktemp) builtin()                       {}
 func (Mktemp) FileChanges(p ParsedCommand) []FileChange {
-	tmpl := "$TMPDIR/tmp.XXXXXXXXXX"
+	tmpl := "tmp.XXXXXXXXXX"
+	dir := "$TMPDIR"
 	if len(p.Operands) > 0 {
 		tmpl = p.Operands[0]
 	}
-	if dir, ok := p.FirstValue("-p", "--tmpdir"); ok && !strings.HasPrefix(tmpl, "/") {
-		tmpl = path.Join(dir, tmpl)
+	forceDir := false
+	if prefix, ok := p.FirstValue("-t"); ok {
+		tmpl = prefix
+		forceDir = true
+	}
+	if tmpDir, ok := p.FirstValue("-p", "--tmpdir"); ok {
+		dir = tmpDir
+		forceDir = true
+	}
+	if suffix, ok := p.FirstValue("--suffix"); ok {
+		tmpl += suffix
+	}
+	if forceDir || path.Dir(tmpl) == "." {
+		tmpl = path.Join(dir, path.Base(tmpl))
 	}
 	return []FileChange{{Op: FileCreate, Path: tmpl, Recursive: p.HasFlag("-d", "--directory")}}
 }

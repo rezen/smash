@@ -9,3 +9,5 @@
 
 # Release tarballs from `just dist`
 /dist/
+
+*.manifest.yaml

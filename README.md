@@ -44,6 +44,36 @@ smash \
   fixtures/fly.sh --non-interactive
 ```
 
+When stdin, stdout, and stderr are attached to a capable terminal and the audit
+target is the default `-`, Smash opens a `tview` split view. A PTY-backed
+terminal in the upper pane preserves TTY detection, ANSI output, and
+interactive prompts—including programs and shell redirections that open
+`/dev/tty` directly—while audit events stream through the scrollable lower
+pane. Press `F6` to switch panes and `Ctrl-C` to stop; after the run, press
+Enter, Escape, or `q` to close the view. Piped or redirected runs keep their
+ordinary stdout/stderr behavior.
+
+Profile a script into a reusable manifest, review it, then enforce that exact
+profile on later runs:
+
+```bash
+smash -profile -profile-output install.manifest.yaml fixtures/fly.sh --non-interactive
+$EDITOR install.manifest.yaml
+smash -manifest install.manifest.yaml fixtures/fly.sh --non-interactive
+```
+
+The manifest records the profiling OS, binds the run to the script body's
+SHA-256, and contains sorted, de-duplicated `commands` and `hosts` lists. A
+manifest run fails before execution if the OS or script changed, enables strict
+command gating, and replaces the run's command and network grants with those
+lists. Profile mode is
+deliberately unrestricted: Smash audits but does not enforce command, disabled,
+mock, downloader, egress, sleep, or raw-socket policy layers. Run profiling
+only for a trusted script or inside an OS sandbox/container. Command statuses
+remain unchanged for conditions and `&&`/`||` lists, while profile mode ignores
+the shell's `set -e` termination action so it does not truncate discovery. It
+never turns a wrapped `sudo` into real privilege escalation.
+
 Or give `smash` the URL that would normally be piped to a shell:
 
 ```bash
@@ -79,11 +109,16 @@ Useful command-line controls:
 | Flag | Purpose |
 |---|---|
 | `-policy FILE` | Read the complete run configuration from YAML |
+| `-profile` | Run and write a manifest with the script hash, commands, and hosts |
+| `-profile-output FILE` | Choose the profile path instead of `<script>.manifest.yaml` |
+| `-manifest FILE` | Verify the script hash and enforce a reviewed profile |
 | `-urls PREFIXES` | Replace the URL prefixes available to `curl` and `wget` |
-| `-git-hosts HOSTS` | Replace the hosts available to Git |
+| `-git-hosts HOSTS` | Apply advisory host checks when real Git is explicitly allowed |
+| `-dns-server IP[:PORT]` | Override the malware-blocking DNS resolver; empty uses system DNS |
 | `-allow COMMANDS` | Add commands to the allow-list, including deliberate grants for sensitive commands |
 | `-disable COMMANDS` | Deny commands after wrappers such as `sudo`, `env`, and `sh -c` are resolved |
 | `-strict` | Block every command that is not allow-listed |
+| `-allow-in-root` | Explicitly permit native executables installed below the run root |
 | `-audit FILE\|-` | Write the YAML audit stream to a file or stderr |
 | `-data N` | Capture up to `N` bytes of stdin and stdout per command |
 
@@ -121,13 +156,15 @@ network:
     - https://github.com/superfly/
     - https://release-assets.githubusercontent.com
   git-hosts: [github.com]
+  max-request: 8MiB
 
 strict: false
+allow-in-root: false
 timeout: 2m
 ```
 
 Policies can also inject request headers, emulate a target OS, add environment
-variables, restrict request methods and response sizes, and mock commands by
+variables, restrict request methods and request/response sizes, and mock commands by
 argv, prefix, name, glob, or resource. Unknown YAML keys are rejected. See the
 [policy reference](docs/policy.md).
 
@@ -150,7 +187,10 @@ managers, and container CLIs—are checked by their parsed egress intent.
 
 The boundary remains soft: environment paths point inside the run root, but a
 permitted host binary can write elsewhere, and an unmodelled network client is
-not recognized unless strict mode blocks it. The [security
+not recognized unless strict mode blocks it. Native executables below the root
+are blocked unless `-allow-in-root` explicitly grants that unsafe capability;
+real Git is likewise sensitive by default because its helpers and repository
+configuration can spawn work outside the in-process model. The [security
 model](docs/security-model.md) explains the guarantees, escape-hatch handling,
 and options for OS-level confinement.
 

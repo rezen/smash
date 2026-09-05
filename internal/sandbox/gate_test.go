@@ -34,11 +34,14 @@ func TestGateDefaultAuditsUnlisted(t *testing.T) {
 // unlisted commands run — a shell given a file, an interpreter, a package tool
 // — and an explicit allow-list entry is what lifts it.
 func TestGateSensitiveBlockedUnlessAllowed(t *testing.T) {
-	for _, script := range []string{`bash -n /dev/null`, `python3 -c 'print(1)'`, `dpkg --version`, `perl -e 1`, `su -c id`} {
+	for _, script := range []string{`bash -n /dev/null`, `python3 -c 'print(1)'`, `dpkg --version`, `perl -e 1`, `su -c id`, `git status`} {
 		_, er, err := runConfined(t, script)
 		if err == nil || !strings.Contains(er, "blocked command:") || !strings.Contains(er, "(sensitive") {
 			t.Errorf("%q should be blocked as sensitive; stderr=%q err=%v", script, er, err)
 		}
+	}
+	if out, er, err := runConfined(t, `git --version`); err != nil || !strings.Contains(out, "git version") {
+		t.Errorf("the exact git version probe should remain available; out=%q stderr=%q err=%v", out, er, err)
 	}
 	// `sh -c` is confined by the interpreter middleware, not the gate…
 	if out, er, err := runConfined(t, `sh -c 'echo inner'`); err != nil || !strings.Contains(out, "inner") {

@@ -16,6 +16,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -31,12 +32,17 @@ import (
 
 	"mvdan.cc/sh/v3/expand"
 
+	profilemanifest "github.com/rezen/smash/internal/manifest"
 	"github.com/rezen/smash/internal/policy"
 	"github.com/rezen/smash/internal/sandbox"
+	"github.com/rezen/smash/internal/splitview"
 )
 
 func main() {
 	if err := runCLI(os.Args[1:]); err != nil {
+		if errors.Is(err, splitview.ErrInterrupted) {
+			os.Exit(130)
+		}
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
@@ -45,7 +51,7 @@ func main() {
 // runCLI runs an arbitrary script under a policy given on the command line, in
 // a policy file, or both:
 //
-//	smash [-policy FILE] [-urls p1,p2] [-urls-github] [-git-hosts h1,h2] [-allow a,b] [-disable a,b] [-strict] [-allow-sudo] [-audit FILE] [-data N] [SCRIPT [ARGS…]]
+//	smash [-policy FILE] [-profile [-profile-output FILE] | -manifest FILE] [-urls p1,p2] [-urls-github] [-git-hosts h1,h2] [-dns-server IP[:PORT]] [-allow a,b] [-disable a,b] [-strict] [-allow-sudo] [-allow-in-root] [-audit FILE] [-data N] [SCRIPT [ARGS…]]
 //	smash -init-policy FILE
 //
 // SCRIPT is a local path or an http(s):// URL; a URL is fetched once, up front,
@@ -62,21 +68,32 @@ func runCLI(argv []string) error {
 	fs := flag.NewFlagSet("smash", flag.ContinueOnError)
 	policyPath := fs.String("policy", "", "read the run's policy from a YAML file; flags given here override it (see -init-policy)")
 	initPolicy := fs.String("init-policy", "", "write a commented boilerplate policy file here (\"-\" = stdout) and exit")
+	profile := fs.Bool("profile", false, "run the script and write its SHA-256 plus observed commands and hosts to a manifest")
+	profileOutput := fs.String("profile-output", "", "profile manifest path (default: <script>.manifest.yaml)")
+	manifestPath := fs.String("manifest", "", "verify the script hash and restrict the run to commands and hosts in this manifest")
 	urls := fs.String("urls", "", "comma-separated URL prefixes to allow (replaces the default)")
 	urlsGitHub := fs.Bool("urls-github", false, "also allow GitHub release downloads (github.com, api.github.com, raw/codeload/objects/release-assets hosts)")
 	gitHosts := fs.String("git-hosts", "", "comma-separated hosts git may reach (replaces the default github.com,gitlab.com,bitbucket.org)")
+	dnsServer := fs.String("dns-server", sandbox.DefaultDNSServer, "DNS resolver IP[:port] for HTTP downloads; an empty value uses the system resolver")
 	allow := fs.String("allow", "", "comma-separated commands to add to the allow-list (also the way to permit a sensitive command such as sudo or python3)")
 	disable := fs.String("disable", "", "comma-separated commands to disable outright")
 	strict := fs.Bool("strict", false, "block every command that is not allow-listed; by default an unlisted command runs and is flagged in the audit log, and only sensitive ones (sudo, shells, interpreters, host package managers, …) are blocked")
 	allowSudo := fs.Bool("allow-sudo", false, "answer sudo/doas credential probes (sudo -v, sudo -l CMD) with success so installers that gate on sudo proceed; sudo CMD still runs CMD confined, never escalated")
+	allowInRoot := fs.Bool("allow-in-root", false, "permit native executables installed inside the sandbox root; unsafe because native code runs outside in-process enforcement")
 	auditPath := fs.String("audit", "-", "write the audit log here (\"-\" = stderr, \"\" = off)")
 	data := fs.Int("data", 0, "bytes of stdin/stdout to capture per command in the audit log")
-	root := fs.String("root", "sandbox", "sandbox directory; it is emptied on every run, so it must be missing, empty, or a previous sandbox")
+	root := fs.String("root", "sandbox", "sandbox directory; it is emptied on every run, so it must be missing, empty, or carry smash's ownership marker")
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
 	if *initPolicy != "" {
 		return policy.WriteTemplate(*initPolicy)
+	}
+	if *profile && *manifestPath != "" {
+		return fmt.Errorf("-profile and -manifest cannot be used together")
+	}
+	if *profileOutput != "" && !*profile {
+		return fmt.Errorf("-profile-output requires -profile")
 	}
 	set := map[string]bool{} // flags the user actually typed
 	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
@@ -99,9 +116,33 @@ func runCLI(argv []string) error {
 	if scriptArg == "" {
 		return fmt.Errorf("usage: smash [flags] SCRIPT|URL [ARGS…]  (or -policy FILE with a script: key, or -init-policy FILE)")
 	}
-	name, script, err := loadScript(scriptArg)
+	effectiveDNS := sandbox.DefaultDNSServer
+	if !*profile && pol.Network != nil && pol.Network.DNSServer != nil {
+		effectiveDNS = *pol.Network.DNSServer
+	}
+	if !*profile && set["dns-server"] {
+		effectiveDNS = *dnsServer
+	}
+	scriptClient, err := sandbox.NewHTTPClient(60*time.Second, effectiveDNS)
 	if err != nil {
 		return err
+	}
+	name, script, err := loadScript(scriptArg, scriptClient)
+	if err != nil {
+		return err
+	}
+	if *profile && *profileOutput == "" {
+		*profileOutput = defaultManifestPath(name)
+	}
+	var runManifest *profilemanifest.Manifest
+	if *manifestPath != "" {
+		runManifest, err = profilemanifest.Load(*manifestPath)
+		if err != nil {
+			return err
+		}
+		if err := runManifest.Verify(script); err != nil {
+			return fmt.Errorf("%s: %w", *manifestPath, err)
+		}
 	}
 
 	rootPath := *root
@@ -114,7 +155,7 @@ func runCLI(argv []string) error {
 	}
 	home := filepath.Join(rootAbs, "home")
 	tmp := filepath.Join(rootAbs, "tmp")
-	if err := resetRoot(rootAbs, home, tmp); err != nil {
+	if err := resetRoot(rootAbs); err != nil {
 		return err
 	}
 	// Scripts probe TERM for colour and screen control (`clear` exits 1 on a
@@ -130,6 +171,9 @@ func runCLI(argv []string) error {
 		"PATH=" + filepath.Join(home, ".local", "bin") + ":/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
 	}, pol.EnvPairs()...)
 	cfg := sandbox.NewConfig(rootAbs, home, expand.ListEnviron(env...))
+	// Keep the caller's terminal attached so interactive installers can use
+	// shell reads and external command prompts.
+	cfg.Stdin = os.Stdin
 	cfg.Args = scriptArgs
 	if err := pol.Apply(&cfg); err != nil {
 		return err
@@ -146,6 +190,9 @@ func runCLI(argv []string) error {
 	if set["git-hosts"] {
 		cfg.Network.GitHosts = splitList(*gitHosts)
 	}
+	if set["dns-server"] {
+		cfg.Network.DNSServer = *dnsServer
+	}
 	if set["allow"] {
 		cfg.Allowed = cfg.Allowed.With(splitList(*allow)...)
 	}
@@ -158,8 +205,19 @@ func runCLI(argv []string) error {
 	if set["allow-sudo"] {
 		cfg.AllowSudo = *allowSudo
 	}
-	if err := cfg.Network.Validate(); err != nil {
-		return err
+	if set["allow-in-root"] {
+		cfg.AllowInRootExecutables = *allowInRoot
+	}
+	if *profile {
+		cfg.Profile = true
+	}
+	if runManifest != nil {
+		runManifest.Apply(&cfg)
+	}
+	if !*profile {
+		if err := cfg.Network.Validate(); err != nil {
+			return err
+		}
 	}
 
 	audit, dataBytes := *auditPath, *data
@@ -171,10 +229,23 @@ func runCLI(argv []string) error {
 			dataBytes = *a.Data
 		}
 	}
+	var view *splitview.View
 	switch audit {
 	case "":
 	case "-":
-		cfg.Auditor = sandbox.TextAuditor(os.Stderr, sandbox.ShortPaths(cfg))
+		var ok bool
+		view, ok, err = splitview.Start(os.Stdin, os.Stdout, os.Stderr)
+		if err != nil {
+			return err
+		}
+		if ok {
+			defer view.Close()
+			cfg.Stdin, cfg.Stdout, cfg.Stderr = view.Stdio()
+			cfg.ControllingTTY = view.TTY()
+			cfg.Auditor = sandbox.TextAuditor(view.EventWriter(), sandbox.ShortPaths(cfg))
+		} else {
+			cfg.Auditor = sandbox.TextAuditor(os.Stderr, sandbox.ShortPaths(cfg))
+		}
 	default:
 		f, err := os.Create(audit)
 		if err != nil {
@@ -184,7 +255,39 @@ func runCLI(argv []string) error {
 		cfg.Auditor = sandbox.TextAuditor(f, sandbox.ShortPaths(cfg))
 	}
 	cfg.AuditData = dataBytes
-	return sandbox.Run(cfg, name, script)
+	var profiler *profilemanifest.Profiler
+	if *profile {
+		profiler = profilemanifest.NewProfiler(name, script, cfg.Auditor)
+		cfg.Auditor = profiler
+	}
+	var runErr error
+	if view != nil {
+		runErr = view.Run(func(ctx context.Context) error {
+			return sandbox.RunContext(ctx, cfg, name, script)
+		})
+	} else {
+		runErr = sandbox.Run(cfg, name, script)
+	}
+	if profiler == nil {
+		return runErr
+	}
+	writeErr := profiler.Manifest().Write(*profileOutput)
+	if writeErr == nil {
+		fmt.Fprintf(os.Stderr, "wrote profile manifest %s\n", *profileOutput)
+	} else {
+		writeErr = fmt.Errorf("writing profile manifest %s: %w", *profileOutput, writeErr)
+	}
+	return errors.Join(runErr, writeErr)
+}
+
+func defaultManifestPath(scriptName string) string {
+	base := filepath.Base(scriptName)
+	ext := filepath.Ext(base)
+	name := strings.TrimSuffix(base, ext)
+	if name == "" {
+		name = "script"
+	}
+	return name + ".manifest.yaml"
 }
 
 // splitList splits a comma-separated flag value, treating "" as the empty list
@@ -196,56 +299,89 @@ func splitList(v string) []string {
 	return strings.Split(v, ",")
 }
 
-// resetRoot empties the sandbox directory and recreates home and tmp inside it.
+// rootMarker is the ownership proof resetRoot requires before deleting
+// anything from a non-empty directory. Directory names such as home and tmp
+// are not proof: an unrelated directory may legitimately contain both.
+const (
+	rootMarker        = ".smash-root"
+	rootMarkerContent = "smash sandbox root v1\n"
+)
+
+// resetRoot empties a sandbox directory and recreates home and tmp inside it.
+// A missing or empty directory is claimed by writing rootMarker. Every later
+// reuse requires that exact marker; a non-empty unmarked directory is refused.
 //
-// The directory is deleted, so it is checked first. A mistyped -root (or a
-// policy file's root:) would otherwise recursively delete whatever the path
-// happens to name — a source tree, a home directory — with no confirmation and
-// no way back. Only an empty directory, a missing one, or one this tool
-// evidently created before is emptied; anything else is refused and named, and
-// the user can delete it themselves if that is what they meant.
-func resetRoot(root, home, tmp string) error {
-	switch reusable, err := reusableRoot(root); {
-	case err != nil:
+// os.Root anchors all inspection and deletion to the directory handle. Even
+// if the path is renamed while cleanup is in progress, RemoveAll cannot escape
+// into a replacement directory or through an outward-pointing symlink.
+func resetRoot(root string) error {
+	fi, err := os.Lstat(root)
+	if errors.Is(err, fs.ErrNotExist) {
+		if err := os.MkdirAll(root, 0o755); err != nil {
+			return err
+		}
+		fi, err = os.Lstat(root)
+	}
+	if err != nil {
 		return err
-	case !reusable:
-		return fmt.Errorf("root %s already exists and is not a previous sandbox; pass -root DIR or remove it first", root)
 	}
-	if err := os.RemoveAll(root); err != nil {
-		return fmt.Errorf("clearing root %s: %w", root, err)
+	if !fi.IsDir() { // a file or a symlink: never ours
+		return fmt.Errorf("root %s exists and is not a directory", root)
 	}
-	for _, d := range []string{home, tmp} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
+
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	opened, err := r.Stat(".")
+	if err != nil || !os.SameFile(fi, opened) {
+		return fmt.Errorf("root %s changed while it was being opened; refusing to clear it", root)
+	}
+	dir, err := r.Open(".")
+	if err != nil {
+		return err
+	}
+	entries, err := dir.ReadDir(-1)
+	dir.Close()
+	if err != nil {
+		return err
+	}
+
+	if len(entries) == 0 {
+		f, err := r.OpenFile(rootMarker, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			return fmt.Errorf("claiming root %s: %w", root, err)
+		}
+		if _, err := io.WriteString(f, rootMarkerContent); err != nil {
+			f.Close()
+			return fmt.Errorf("claiming root %s: %w", root, err)
+		}
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("claiming root %s: %w", root, err)
+		}
+	} else {
+		markerInfo, statErr := r.Lstat(rootMarker)
+		marker, err := r.ReadFile(rootMarker)
+		if statErr != nil || !markerInfo.Mode().IsRegular() || err != nil || string(marker) != rootMarkerContent {
+			return fmt.Errorf("root %s is non-empty and has no valid %s marker; choose an empty directory or remove it yourself", root, rootMarker)
+		}
+	}
+
+	for _, e := range entries {
+		if e.Name() == rootMarker {
+			continue
+		}
+		if err := r.RemoveAll(e.Name()); err != nil {
+			return fmt.Errorf("clearing %s from root %s: %w", e.Name(), root, err)
+		}
+	}
+	for _, d := range []string{"home", "tmp"} {
+		if err := r.MkdirAll(d, 0o755); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-// reusableRoot reports whether root may be deleted: it does not exist, it is
-// an empty directory, or it holds nothing but the home and tmp a previous run
-// created. A file, a symlink, or a directory with anything else in it is not.
-func reusableRoot(root string) (bool, error) {
-	fi, err := os.Lstat(root)
-	if errors.Is(err, fs.ErrNotExist) {
-		return true, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if !fi.IsDir() { // a file or a symlink: never ours
-		return false, nil
-	}
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		return false, err
-	}
-	for _, e := range entries {
-		if !e.IsDir() || (e.Name() != "home" && e.Name() != "tmp") {
-			return false, nil
-		}
-	}
-	return true, nil
 }
 
 // maxScriptBytes bounds a remote installer's size; real ones are tens of KiB.
@@ -257,7 +393,7 @@ const maxScriptBytes = 16 << 20
 // fetch is the user's explicit request, so it is not subject to the sandbox's
 // URL allow-list — only the script's own downloads are. Anything else is a
 // local path. It returns the display name used in the audit log and the source.
-func loadScript(arg string) (name, src string, err error) {
+func loadScript(arg string, client *http.Client) (name, src string, err error) {
 	u, perr := url.Parse(arg)
 	if perr != nil || (u.Scheme != "http" && u.Scheme != "https") {
 		b, err := os.ReadFile(arg)
@@ -266,7 +402,6 @@ func loadScript(arg string) (name, src string, err error) {
 		}
 		return filepath.Base(arg), string(b), nil
 	}
-	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.Get(arg)
 	if err != nil {
 		return "", "", fmt.Errorf("fetch %s: %w", arg, err)

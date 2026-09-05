@@ -97,7 +97,7 @@ type CurlParams struct {
 	Referer    string   `flag:"-e,--referer"`
 	Headers    []string `flag:"-H,--header" secret:"true"` // may carry Authorization
 	Cookies    []string `flag:"-b,--cookie" secret:"true"`
-	Data       string   `flag:"-d,--data,--data-raw,--data-binary,--data-urlencode" secret:"true"`
+	Data       []string `flag:"-d,--data,--data-raw,--data-binary,--data-urlencode" secret:"true"`
 	WriteOut   string   `flag:"-w,--write-out"`              // printed after the transfer; %{http_code} and %{url_effective} are supported
 	URL        string   `operand:"url" resource:"url,fetch"` // declared before Output so the log reads fetch-then-write
 	Output     string   `flag:"-o,--output" resource:"path,write,stdout"`

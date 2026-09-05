@@ -1,10 +1,12 @@
 package sandbox
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -99,6 +101,57 @@ func TestInRootExecutionIsFlagged(t *testing.T) {
 		}
 	}
 	t.Errorf("no audit record for the in-root program; records=%+v", recs)
+}
+
+// TestNativeHelperProcess is executed through a copied test binary by
+// TestInRootNativeExecutableNeedsExplicitGrant. In the ordinary test process
+// the environment guard makes it a no-op.
+func TestNativeHelperProcess(t *testing.T) {
+	if os.Getenv("SMASH_NATIVE_HELPER") != "1" {
+		return
+	}
+	fmt.Println("native-ran")
+	os.Exit(0)
+}
+
+// TestInRootNativeExecutableNeedsExplicitGrant proves that putting native code
+// below Root is not itself permission to run outside the interpreter stack.
+func TestInRootNativeExecutableNeedsExplicitGrant(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	install := "cp " + strconv.Quote(exe) + " \"$HOME/x\"\nchmod +x \"$HOME/x\"\n" +
+		"SMASH_NATIVE_HELPER=1 \"$HOME/x\" -test.run=TestNativeHelperProcess\n"
+
+	out, er, err := runConfined(t, install, withHome(t), func(c *Config) { c.Strict = true })
+	if err == nil || strings.Contains(out, "native-ran") || !strings.Contains(er, "blocked native executable inside root") {
+		t.Fatalf("native executable escaped strict mode: err=%v stdout=%q stderr=%q", err, out, er)
+	}
+
+	allowNative := func(c *Config) {
+		c.Strict = true
+		c.AllowInRootExecutables = true
+	}
+	out, er, err = runConfined(t, install, withHome(t), allowNative)
+	if err != nil || !strings.Contains(out, "native-ran") {
+		t.Fatalf("explicitly granted native executable did not run: err=%v stdout=%q stderr=%q", err, out, er)
+	}
+}
+
+// An allowed basename must not cause os/exec to resolve a script-controlled
+// PATH entry. The gate detects the in-root executable before the name grant.
+func TestAllowedCommandCannotBeShadowedFromRoot(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := "cp " + strconv.Quote(exe) + " \"$HOME/uname\"\nchmod +x \"$HOME/uname\"\n" +
+		"PATH=\"$HOME:$PATH\" SMASH_NATIVE_HELPER=1 uname -test.run=TestNativeHelperProcess\n"
+	out, er, err := runConfined(t, script, withHome(t), func(c *Config) { c.Strict = true })
+	if err == nil || strings.Contains(out, "native-ran") || !strings.Contains(er, "blocked native executable inside root") {
+		t.Fatalf("PATH shadow bypassed the gate: err=%v stdout=%q stderr=%q", err, out, er)
+	}
 }
 
 // TestFetchCannotWriteOutsideRoot: the in-process curl is the one write the

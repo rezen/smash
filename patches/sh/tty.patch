@@ -1,0 +1,76 @@
+--- a/interp/handler.go
++++ b/interp/handler.go
+@@ -45,6 +45,20 @@ func WithHandlerContext(ctx context.Context, hc HandlerContext) context.Context {
+ 	return context.WithValue(ctx, handlerCtxKey{}, hc)
+ }
+ 
++type controllingTTYKey struct{}
++
++// WithControllingTTY marks tty as the terminal an executed child should
++// acquire as its controlling terminal. The descriptor is inherited separately
++// from stdin/stdout/stderr so shell pipelines and redirections remain intact.
++func WithControllingTTY(ctx context.Context, tty *os.File) context.Context {
++	return context.WithValue(ctx, controllingTTYKey{}, tty)
++}
++
++func controllingTTYFrom(ctx context.Context) *os.File {
++	tty, _ := ctx.Value(controllingTTYKey{}).(*os.File)
++	return tty
++}
++
+ type handlerKind int
+ 
+ const (
+@@ -171,6 +185,11 @@ func DefaultExecHandler(killTimeout time.Duration) ExecHandlerFunc {
+ 			cmd.Stdin = hc.Stdin
+ 			cmd.Stdout = hc.Stdout
+ 			cmd.Stderr = hc.Stderr
++			if tty := controllingTTYFrom(ctx); tty != nil {
++				childFD := 3 + len(cmd.ExtraFiles)
++				cmd.ExtraFiles = append(cmd.ExtraFiles, tty)
++				setControllingTTY(cmd, childFD)
++			}
+ 			if killTimeout > 0 && runtime.GOOS != "windows" {
+ 				// On cancellation, send an interrupt signal first, and let
+ 				// WaitDelay escalate to a kill signal if the process does not
+--- a/interp/os_unix.go
++++ b/interp/os_unix.go
+@@ -8,6 +8,7 @@ package interp
+ import (
+ 	"context"
+ 	"errors"
++	"os/exec"
+ 	"os/user"
+ 	"strconv"
+ 	"syscall"
+@@ -17,6 +18,14 @@ import (
+ 	"mvdan.cc/sh/v3/syntax"
+ )
+ 
++func setControllingTTY(cmd *exec.Cmd, childFD int) {
++	cmd.SysProcAttr = &syscall.SysProcAttr{
++		Setsid:  true,
++		Setctty: true,
++		Ctty:    childFD,
++	}
++}
++
+ func mkfifo(path string, mode uint32) error {
+ 	return unix.Mkfifo(path, mode)
+ }
+--- a/interp/os_notunix.go
++++ b/interp/os_notunix.go
+@@ -8,11 +8,14 @@ package interp
+ import (
+ 	"context"
+ 	"fmt"
++	"os/exec"
+ 
+ 	"mvdan.cc/sh/v3/syntax"
+ )
+ 
++func setControllingTTY(_ *exec.Cmd, _ int) {}
++
+ func mkfifo(path string, mode uint32) error {
+ 	return fmt.Errorf("unsupported")
+ }

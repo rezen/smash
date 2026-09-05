@@ -17,6 +17,12 @@ fixtures/brew-install.sh     vendored Homebrew installer (Linux-emulation contai
 fixtures/starship.sh         vendored Starship installer (POSIX-sh guard; mocked-network test)
 cmd/smash/main.go            the CLI: run a local or remote install script under a policy
 
+internal/splitview/  tview split UI, PTY/VT script terminal, and live audit-event pane
+  splitview.go   real-TTY split view, terminal emulation, input forwarding, and resizing
+
+internal/manifest/  profile manifest hashing, audit collection, YAML IO, and enforcement
+  manifest.go   Manifest + Profiler (script SHA-256, observed commands and hosts)
+
 internal/policy/    the YAML policy file (-policy, -init-policy)
   policy.go     File + Load/Parse (strict: unknown keys rejected) + Apply onto a sandbox.Config
   template.go   Template — the commented boilerplate -init-policy writes
@@ -47,11 +53,19 @@ internal/sandbox/   the enforcement stack on mvdan/sh
   allowlist.go  DefaultAllowList + DefaultSensitiveList + the command gate (unlisted runs audited; Strict) / in-sandbox escape hatch, shebang-aware
   middleware.go unwrap (+ the wrapper chain for the audit record) + sleep cap
   shinterp.go   confined interpretation of `sh -c` and of in-root shell scripts
-  network.go    Policy (structural URL matching), in-process curl/wget (net/http), egress guard
+  controlling_tty_unix.go   /dev/tty routing and controlling-PTY session handoff
+  network.go    Policy (structural URL matching), HTTP client wiring, egress guard
   devnet.go     /dev/tcp + /dev/udp detection
-  detection.go  CallHandler shims (downloader probe, typeset compat)
+  detection.go  CallHandler shims (in-process tool probe, typeset compat)
   emulate.go    Emulation: fake uname + virtual files
   fixups.go     AST rewrites where mvdan/sh and bash differ (subshell `return`)
   vars.go       RunVars (resolved variable table) + Assignments (static AST walk)
   *_test.go     egress, unwrap, redirects, rvm/get-docker containment
+
+internal/tool/   portable in-process command implementations
+  base64.go      GNU/BSD-compatible encoding and decoding
+  downloader.go  policy-configured curl/wget execution and confined IO
+  mktemp.go      common GNU/BSD forms, honoring TMPDIR
+  sha256sum.go   SHA-256 generation and checksum verification
+  tool.go        tool discovery and shared failures
 ```

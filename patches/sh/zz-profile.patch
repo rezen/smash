@@ -1,0 +1,52 @@
+--- a/interp/api.go
++++ b/interp/api.go
+@@ -141,5 +141,9 @@
+ 	// such as the condition in a [syntax.IfClause].
+ 	noErrExit bool
+ 
++	// smash patch: preserve failing statuses but do not let the errexit option
++	// terminate profile discovery.
++	ignoreErrexit bool
++
+ 	// The current and last exit statuses. They can only be different if
+ 	// the interpreter is in the middle of running a statement. In that
+@@ -503,6 +507,13 @@
+ 	}
+ }
+ 
++// IgnoreErrexit makes the runner preserve non-zero command statuses while
++// preventing the errexit shell option from terminating execution. Conditional
++// and AND/OR-list semantics are unchanged. It is intended for profiling.
++func IgnoreErrexit(enabled bool) RunnerOption {
++	return func(r *Runner) error { r.ignoreErrexit = enabled; return nil }
++}
++
+ // CallHandler sets the call handler. See [CallHandlerFunc] for more info.
+ func CallHandler(f CallHandlerFunc) RunnerOption {
+ 	return func(r *Runner) error {
+@@ -896,6 +907,7 @@
+ 		readDirHandler: r.readDirHandler,
+ 		statHandler:    r.statHandler,
+ 		accessHandler:  r.accessHandler,
++		ignoreErrexit:  r.ignoreErrexit,
+ 
+ 		// These can be set by functions like [Dir] or [Params], but
+ 		// builtins can overwrite them; reset the fields to whatever the
+@@ -1096,6 +1108,7 @@
+ 		usedNew:        r.usedNew,
+ 		exit:           r.exit,
+ 		lastExit:       r.lastExit,
++		ignoreErrexit:  r.ignoreErrexit,
+ 
+ 		origStdout: r.origStdout, // used for process substitutions
+ 	}
+--- a/interp/runner.go
++++ b/interp/runner.go
+@@ -378,6 +378,6 @@
+ 		//   preceded by !; excluded via "else" above
+ 		//   compound bodies (if/{ }/for/while/case); excluded via "else" above
+-		if r.opts[optErrExit] {
++		if r.opts[optErrExit] && !r.ignoreErrexit {
+ 			r.exit.exiting = true
+ 		}
+ 	}

@@ -6,6 +6,8 @@ filesystem-environment, and audit policy.
 ```text
 smash [flags] SCRIPT|URL [ARGS…]
 smash -policy FILE [flags] [SCRIPT [ARGS…]]
+smash -profile [flags] SCRIPT|URL [ARGS…]
+smash -manifest FILE [flags] SCRIPT|URL [ARGS…]
 smash -init-policy FILE
 ```
 
@@ -36,25 +38,103 @@ Arguments following the script become its `$1`, `$2`, and so on. If both the
 policy and command line name a script, the command-line script and its arguments
 replace the policy's `script` and `args` together.
 
+For an interactive terminal run with the default `-audit -`, a `tview` display
+is split horizontally. The upper pane is a PTY-backed terminal carrying the
+script's stdin, stdout, and stderr, so terminal detection, ANSI control
+sequences, line editing, and no-echo prompts keep working. External programs
+acquire that PTY as their controlling terminal, and shell opens of `/dev/tty`
+are routed there as well. The lower pane is a scrollable stream of Smash audit
+events. `F6` switches focus between panes and
+`Ctrl-C` stops the run. The completed view remains open for inspection until
+Enter, Escape, or `q` is pressed.
+
+The split is disabled automatically if any standard stream is redirected,
+input is piped, `$TERM` is empty or `dumb`, the terminal is too small, or the
+audit target is a file or disabled.
+
 ## Flags
 
 | Flag | Default | Meaning |
 |---|---:|---|
 | `-policy FILE` | — | Read the base configuration from a YAML policy file |
 | `-init-policy FILE` | — | Write a commented policy template and exit; `-` writes to stdout |
+| `-profile` | false | Run and write the script SHA-256 plus observed commands and hosts to a manifest |
+| `-profile-output FILE` | `<script>.manifest.yaml` | Set the generated manifest path; requires `-profile` |
+| `-manifest FILE` | — | Verify the script SHA-256 and restrict commands and hosts to a manifest |
 | `-urls p1,p2` | GitHub's common download hosts | Replace the URL prefixes available to in-process `curl` and `wget` |
 | `-urls-github` | false | Add GitHub API, raw, codeload, objects, and release-asset hosts |
-| `-git-hosts h1,h2` | GitHub, GitLab, Bitbucket | Replace the hosts Git may clone, fetch, or push to |
+| `-git-hosts h1,h2` | GitHub, GitLab, Bitbucket | Advisory host checks for explicitly allowed real Git operations |
+| `-dns-server IP[:PORT]` | `9.9.9.9:53` | Resolver for initial and in-process HTTP downloads; an empty value uses system DNS |
 | `-allow a,b` | — | Add commands to the default allow-list; also permits named sensitive commands |
 | `-disable a,b` | — | Deny commands outright after wrapper resolution |
 | `-strict` | false | Deny every command not on the allow-list |
 | `-allow-sudo` | false | Make sudo/doas credential probes succeed; commands still run without escalation |
+| `-allow-in-root` | false | Permit native executables below the run root; this explicitly leaves in-process enforcement |
 | `-audit FILE\|-` | `-` | Write the audit stream to a file or stderr; an empty value disables it |
 | `-data N` | 0 | Capture at most `N` bytes each of command stdin and stdout |
 | `-root DIR` | `sandbox` | Recreated directory used for the run's `HOME`, `TMPDIR`, and leading `PATH` |
 
 Comma-separated list flags do not trim or interpret their entries. URL entries
 must include a scheme.
+
+## Profile manifests
+
+Create a behavioral profile while running the script:
+
+```bash
+smash -profile install.sh
+smash -profile -profile-output install.manifest.yaml install.sh
+```
+
+The output is deterministic YAML suitable for review and source control:
+
+```yaml
+version: 1
+os: linux
+script:
+  name: install.sh
+  sha256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+commands:
+  - curl
+  - mkdir
+  - tar
+hosts:
+  - downloads.example.com
+```
+
+`os` uses Go's canonical operating-system name (such as `linux` or `darwin`).
+Commands and hosts are sorted and de-duplicated. Profiling is discovery mode:
+the audit and profile collectors remain active, but Smash bypasses its disabled
+and sensitive command gates, strict mode, mocks, in-process downloader policy,
+general egress guard, sleep cap, in-root native executable gate, and raw-socket
+guard. Real programs and network clients therefore execute directly. Their own
+external-command failures retain their real status in the audit and in shell
+conditions and `&&`/`||` lists. Only `set -e` termination is ignored, so a
+false probe cannot select a success branch and errexit cannot truncate later
+discovery. This does not make privileged operations succeed: `sudo` remains
+unwrapped and never elevates. Shell syntax errors, explicit `exit` calls, and a
+non-zero final status can still end the run. Use profile mode only for a trusted
+script or inside separate OS-level confinement such as a container.
+
+After review, enforce it with:
+
+```bash
+smash -manifest install.manifest.yaml install.sh
+```
+
+The script is loaded first and its bytes must match `script.sha256`; a remote
+script is therefore verified after its initial fetch and before execution. A
+manifest that names a different OS is also rejected. The manifest then enables
+strict command gating, replaces the command allow-list,
+replaces URL-prefix grants with exact host grants, and uses the same host set
+for explicitly allowed Git. Other policy settings such as mocks, environment,
+timeouts, request limits, and disabled commands still apply. `-profile` and
+`-manifest` are mutually exclusive.
+
+A profile describes one observed execution path, not every path the script can
+take. Arguments, environment, platform, server responses, and timing can expose
+different behavior, so treat a generated manifest as review input and exercise
+the variants you intend to support.
 
 ## Root handling
 
@@ -63,10 +143,16 @@ The root is cleared before every run. To protect against a mistyped path,
 
 - missing;
 - empty; or
-- recognizable as a previous root containing only `home` and `tmp` directories.
+- marked by a valid `.smash-root` ownership file created by an earlier run.
 
-A file, symlink, or directory containing anything else is refused instead of
-deleted.
+A file, symlink, or non-empty unmarked directory is refused instead of deleted.
+Merely containing directories named `home` and `tmp` is not proof of ownership.
+Cleanup is anchored to an open root handle so path or symlink replacement
+cannot redirect deletion outside it.
+
+Roots created by older versions have no marker and are intentionally refused;
+remove that old sandbox directory once after confirming it contains no data to
+keep.
 
 Inside the run, `HOME` and `TMPDIR` point below the root. `PATH` starts with
 `$HOME/.local/bin`, followed by common host binary directories. This is a soft

@@ -8,13 +8,13 @@ import (
 	"context"
 	"strings"
 
-	"github.com/rezen/smash/internal/command"
+	"github.com/rezen/smash/internal/tool"
 )
 
 // detectionCallHandler is the single CallHandler; it dispatches to the shims.
 func detectionCallHandler(ctx context.Context, args []string) ([]string, error) {
 	args = shimCommandDefaultPath(args)
-	if rewritten, ok := shimDownloaderProbe(args); ok {
+	if rewritten, ok := shimToolProbe(args); ok {
 		return rewritten, nil
 	}
 	if rewritten, ok := shimDeclarationBuiltin(args); ok {
@@ -40,16 +40,13 @@ func shimCommandDefaultPath(args []string) []string {
 	return out
 }
 
-// shimDownloaderProbe fakes `command -v curl|wget` so downloader detection
-// succeeds with no curl/wget on the host PATH — every command.Downloader is
-// served in-process by httpMiddleware. The path is cosmetic (installers only
-// check it's not under /snap/). Other probes (`command -v sha256sum`, …) are
-// left honest.
-func shimDownloaderProbe(args []string) ([]string, bool) {
-	if len(args) >= 3 && args[0] == "command" && (args[1] == "-v" || args[1] == "-V") {
-		if _, ok := command.Lookup(args[2]).(command.Downloader); ok {
-			return []string{"echo", "/opt/sandbox/bin/" + args[2]}, true
-		}
+// shimToolProbe makes commands implemented in-process visible
+// to `command -v`, even if no host binary exists. Without this, installers
+// may skip a portable implementation before they ever invoke it. The path is
+// cosmetic; installers occasionally inspect it (for example, rejecting snap).
+func shimToolProbe(args []string) ([]string, bool) {
+	if len(args) >= 3 && args[0] == "command" && (args[1] == "-v" || args[1] == "-V") && tool.Is(args[2]) {
+		return []string{"echo", "/opt/sandbox/bin/" + args[2]}, true
 	}
 	return nil, false
 }

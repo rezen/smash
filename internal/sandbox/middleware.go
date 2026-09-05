@@ -64,6 +64,21 @@ func sudoGrantMiddleware(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 
 var sudoNames = command.NewSet("sudo", "doas")
 
+// gitVersionMiddleware permits only the inert availability/version probe that
+// installers commonly use. Every functional git invocation continues to the
+// command gate, where git is sensitive unless explicitly granted.
+func gitVersionMiddleware(path string) Middleware {
+	def := interp.DefaultExecHandler(2 * time.Second)
+	return func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
+		return func(ctx context.Context, args []string) error {
+			if path == "" || len(args) != 2 || filepath.Base(args[0]) != "git" || args[1] != "--version" {
+				return next(ctx, args)
+			}
+			return def(ctx, []string{path, "--version"})
+		}
+	}
+}
+
 // sleepCapMiddleware caps `sleep` so a script can't burn real wall-time.
 func sleepCapMiddleware(maxCap time.Duration) Middleware {
 	return func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {

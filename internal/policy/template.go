@@ -26,8 +26,8 @@ const Template = `# smash policy — everything one run needs, in one file.
 
 # ---------------------------------------------------------------- the run ---
 
-# The sandbox directory. It is RECREATED on every run: HOME and TMPDIR live
-# inside it, and a binary that resolves inside it may execute.
+# The sandbox directory. Its contents are RECREATED on every run after a
+# .smash-root ownership marker is verified. HOME and TMPDIR live inside it.
 #root: sandbox
 
 # The installer to run: a local path, or an http(s):// URL fetched like
@@ -45,10 +45,15 @@ const Template = `# smash policy — everything one run needs, in one file.
 #env:
 #  UV_INSTALL_DIR: /home/.local/bin
 
-# Block every command that is neither allow-listed nor inside root. Off, an
+# Block every command that is not allow-listed. Off, an
 # unlisted command runs and is flagged 'unlisted: true' in the audit log, and
 # only the sensitive list is enforced.
 #strict: false
+
+# Permit native executables installed below root. Native code runs outside the
+# in-process command and network model, so this is an explicit unsafe grant.
+# Shell scripts below root are still interpreted confined without this.
+#allow-in-root: false
 
 # Answer sudo/doas credential probes (` + "`sudo -v`, `sudo -n -l CMD`" + `) with success,
 # so an installer that gates on them proceeds. Nothing escalates: ` + "`sudo CMD`" + `
@@ -111,9 +116,9 @@ network:
   # release-assets., …) on top of 'urls'. The CLI's -urls-github.
   #github: false
 
-  # The hosts git may clone/fetch/push to, over any transport; a subdomain of a
-  # listed host counts. Git bypasses the in-process HTTP client, so this is the
-  # only gate on where it talks to. Setting it replaces the default forges.
+  # Advisory host checks applied when real git is explicitly allow-listed.
+  # Git is sensitive by default because its helpers and config can spawn work
+  # outside the in-process model. Setting this replaces the default forges.
   #git-hosts: [github.com, gitlab.com, bitbucket.org]
 
   # HTTP methods a downloader may use. Setting this replaces the default.
@@ -123,8 +128,16 @@ network:
   # ("200MiB", "1GB" — binary units are powers of 1024, decimal ones of 1000).
   #max-response: 200MiB
 
+  # Request-body cap for curl -d/--data-binary and related flags.
+  #max-request: 8MiB
+
   # Per-request timeout.
   #timeout: 60s
+
+  # DNS resolver used by both the initial script fetch and in-process
+  # curl/wget. Quad9 blocks known malicious domains and validates DNSSEC.
+  # Set this to "" to use the host's system resolver instead.
+  #dns-server: 9.9.9.9:53
 
   # Headers added to every request the sandbox makes — a broker token, say, so
   # the secret never appears in the sandboxed script itself.

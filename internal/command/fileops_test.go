@@ -25,6 +25,8 @@ func TestFileChanges(t *testing.T) {
 		"ln -s ../target":                   "link ../target → target",
 		"mktemp":                            "create $TMPDIR/tmp.XXXXXXXXXX",
 		"mktemp -d /tmp/uv.XXXX":            "create /tmp/uv.XXXX (recursive)",
+		"mktemp -dq -t stage.XXXX":          "create $TMPDIR/stage.XXXX (recursive)",
+		"mktemp --suffix=.log trace.XXXX":   "create $TMPDIR/trace.XXXX.log",
 		"tee -a log.txt":                    "write log.txt",
 		"unzip -d out pkg.zip":              "extract pkg.zip → out (recursive)",
 		"unzip -l pkg.zip":                  "",

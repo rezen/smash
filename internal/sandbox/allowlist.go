@@ -4,10 +4,9 @@ package sandbox
 // running the real program and refusing it:
 //
 //   - allow-listed: runs;
-//   - resolving INSIDE the sandbox tree (so a freshly-installed uv can run,
-//     but a host-global uv cannot): runs, flagged `in-root` — but a script
-//     there is judged by the interpreter its `#!` line names, and a shell
-//     script is interpreted confined rather than handed to a real shell;
+//   - resolving INSIDE the sandbox tree: shell scripts are interpreted
+//     confined, other shebangs are judged by their interpreter, and opaque
+//     native binaries require AllowInRootExecutables;
 //   - sensitive (privilege, host package managers, shells and interpreters
 //     that would run unconfined, …): blocked unless allow-listed explicitly;
 //   - anything else — the long tail of df/sw_vers/lsb_release-style probes
@@ -24,7 +23,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"mvdan.cc/sh/v3/interp"
 
@@ -61,9 +59,6 @@ func DefaultAllowList() command.Set {
 		// runs before this allow-list, so granting the binary does not grant
 		// the network
 		"gpg", "gpg2", "gpgv",
-		// source: git may run, but the egress guard holds clone/fetch/pull/push
-		// to Policy.GitHosts (GitHub, GitLab, Bitbucket by default)
-		"git",
 		// probes: `which node`, `npm --version` (nvm's post-install checks);
 		// npm's network subcommands still go through the egress guard
 		"which", "npm",
@@ -91,6 +86,10 @@ func DefaultSensitiveList() command.Set {
 		// `sh file.sh`, `bash <(curl …)` or `python3 -c …` would not be
 		"sh", "bash", "dash", "ash", "zsh", "ksh", "fish", "csh", "tcsh",
 		"python", "python2", "python3", "perl", "ruby", "node", "deno", "bun", "php", "lua", "tclsh", "osascript",
+		// git is extensible through aliases, hooks, helpers, transports and
+		// repository config. A real git process can spawn work the in-process
+		// middleware never sees, so it is an explicit unsafe grant.
+		"git",
 		// host package managers and installers: they write outside the root
 		// (the networked ones — apt-get, brew, pip, … — are also held by the
 		// egress guard; these are the offline/local-file paths)
@@ -130,12 +129,14 @@ func gateNoteFrom(ctx context.Context) *gateNote {
 // gate is the command gate's policy: the sets it consults, the root whose
 // contents may run, and how to interpret an in-root shell script confined.
 type gate struct {
-	root      string
-	allowed   command.Set
-	sensitive command.Set
-	denied    command.Set
-	strict    bool
-	interpret scriptRunner
+	root                   string
+	allowed                command.Set
+	sensitive              command.Set
+	denied                 command.Set
+	strict                 bool
+	allowInRootExecutables bool
+	allowedPaths           map[string]string
+	interpret              scriptRunner
 }
 
 // allowListMiddleware is the command gate described at the top of this file,
@@ -143,20 +144,25 @@ type gate struct {
 // run. The three sets are consulted by command name (a path is reduced to its
 // base); the escape hatch by resolved location.
 func allowListMiddleware(g gate) Middleware {
-	def := interp.DefaultExecHandler(2 * time.Second)
 	return func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 		return func(ctx context.Context, args []string) error {
 			if len(args) == 0 {
-				return def(ctx, args)
+				return next(ctx, args)
 			}
 			hc := interp.HandlerCtx(ctx)
 			allowed, sensitive, strict := g.allowed, g.sensitive, g.strict
 			name := filepath.Base(args[0])
 			switch {
-			case allowed[name]:
-				return def(ctx, args) // run the real program
 			case resolveInSandbox(hc, g.root, args[0]) != "":
-				return g.runFromRoot(ctx, def, hc, args)
+				return g.runFromRoot(ctx, next, hc, args)
+			case allowed[name]:
+				path := g.allowedPaths[name]
+				if path == "" {
+					return failf(hc.Stderr, 127, "%s: command not found on the configured PATH", args[0])
+				}
+				trusted := append([]string(nil), args...)
+				trusted[0] = path // do not let a script shadow an allowed name via PATH
+				return next(ctx, trusted)
 			case sensitive[name]:
 				return failf(hc.Stderr, 127, "[sandbox] blocked command: %s (sensitive; allow-list it to permit)", args[0])
 			case strict:
@@ -170,7 +176,7 @@ func allowListMiddleware(g gate) Middleware {
 			if n := gateNoteFrom(ctx); n != nil {
 				n.Unlisted = true
 			}
-			return def(ctx, args)
+			return next(ctx, args)
 		}
 	}
 }
@@ -178,7 +184,7 @@ func allowListMiddleware(g gate) Middleware {
 // runFromRoot runs a program that resolved inside the sandbox root — the
 // escape hatch that lets a freshly installed binary execute.
 //
-// The hatch is not a licence to run anything, because the gate reasons about
+// The optional hatch is not implicit permission to run anything, because the gate reasons about
 // argv[0] while the KERNEL runs whatever a `#!` line names. Writing an
 // executable into the root is not an exotic capability; it is what every
 // installer does. So a script installed in the root would otherwise be the
@@ -187,12 +193,12 @@ func allowListMiddleware(g gate) Middleware {
 //
 //	printf '#!/bin/bash\n…\n' > "$HOME/x"; chmod +x "$HOME/x"; "$HOME/x"
 //
-// A shell script never reaches here at all — shInterpMiddleware, upstream,
+// A shell script never reaches a host shell — it is interpreted below,
 // interprets it confined the way it does `sh -c`. What is left is a script for
 // some other interpreter, which is judged as if that interpreter had been
-// invoked directly, and a real binary, which runs and is flagged InRoot so the
-// hatch is never silent in the audit trail.
-func (g gate) runFromRoot(ctx context.Context, def interp.ExecHandlerFunc, hc interp.HandlerContext, args []string) error {
+// invoked directly, and a real binary, which needs the explicit
+// AllowInRootExecutables capability and is flagged InRoot.
+func (g gate) runFromRoot(ctx context.Context, execute interp.ExecHandlerFunc, hc interp.HandlerContext, args []string) error {
 	path := resolveInSandbox(hc, g.root, args[0])
 	via, hasShebang := shebangInterpreter(path)
 	name := filepath.Base(via)
@@ -223,8 +229,40 @@ func (g gate) runFromRoot(ctx context.Context, def interp.ExecHandlerFunc, hc in
 		case g.strict:
 			return failf(hc.Stderr, 127, "[sandbox] blocked command: %s (%s runs it)", via, args[0])
 		}
+	} else if !g.allowInRootExecutables {
+		return failf(hc.Stderr, 126, "[sandbox] blocked native executable inside root: %s (set allow-in-root to permit)", args[0])
 	}
-	return def(ctx, args)
+	return execute(ctx, args)
+}
+
+// resolveAllowedPaths snapshots where every allowed host command resolves
+// before the script can mutate PATH. The command gate executes these absolute
+// paths instead of asking os/exec to resolve a possibly shadowed bare name.
+func resolveAllowedPaths(cfg Config) map[string]string {
+	paths := make(map[string]string, len(cfg.Allowed))
+	for name := range cfg.Allowed {
+		if path := resolveHostCommandPath(cfg, name); path != "" {
+			paths[name] = path
+		}
+	}
+	return paths
+}
+
+func resolveHostCommandPath(cfg Config, name string) string {
+	for _, dir := range filepath.SplitList(cfg.Env.Get("PATH").String()) {
+		if dir == "" {
+			continue
+		}
+		candidate := filepath.Join(dir, name)
+		abs, err := filepath.Abs(candidate)
+		if err != nil || withinRoot(cfg.Root, abs) {
+			continue
+		}
+		if info, err := os.Stat(abs); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+			return abs
+		}
+	}
+	return ""
 }
 
 // shebangInterpreter returns the interpreter a file's `#!` line names. ok is

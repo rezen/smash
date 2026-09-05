@@ -44,7 +44,10 @@ func TestGitNamedRemote(t *testing.T) {
 	// A file:// remote reaches no network, so the egress guard lets it through
 	// on that basis alone; AllowedPrefixes does not grant git anything (see
 	// Policy.AllowsGit) and GitHosts cannot name a hostless URL.
-	allowUpstream := func(c *Config) { c.Network.GitHosts = nil }
+	allowUpstream := func(c *Config) {
+		c.Network.GitHosts = nil
+		c.Allowed = c.Allowed.With("git")
+	}
 
 	t.Run("allowed via --git-dir", func(t *testing.T) {
 		repo := mkRepo(t, upstreamURL)

@@ -98,15 +98,13 @@ func TestUVInstallerAuditTrail(t *testing.T) {
 			t.Errorf("audit file changes missing %q; got %v", want, changes)
 		}
 	}
-	// Nothing lands outside the sandbox root except the installer's scratch
-	// dir: it uses `mktemp -d`, and macOS's mktemp ignores TMPDIR, so that one
-	// tree sits in the OS temp dir. (The mktemp describer reports its template,
-	// "$TMPDIR/…", not a real path.)
-	osTmp := filepath.Clean(os.TempDir()) + string(filepath.Separator)
+	// The in-process mktemp implementation keeps the installer's scratch tree
+	// in the configured TMPDIR. The describer reports its unexpanded
+	// "$TMPDIR/…" template rather than the generated path.
 	for _, r := range recs {
 		for _, c := range r.Files {
 			inRoot := strings.HasPrefix(c.Path, cfg.Root+string(filepath.Separator))
-			if !inRoot && !strings.HasPrefix(c.Path, osTmp) && !strings.HasPrefix(c.Path, "$") {
+			if !inRoot && !strings.HasPrefix(c.Path, "$") {
 				t.Errorf("%s changed a path outside the sandbox root: %s", r.Name, c.Path)
 			}
 		}

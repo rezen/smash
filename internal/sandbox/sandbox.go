@@ -3,9 +3,10 @@
 // list, and an audit trail for the unremarkable rest), an in-process network
 // layer, and a scoped directory.
 //
-// mvdan/sh interprets only the shell *language*; every external command
-// (uname, tar, …) is delegated to a real host binary via os/exec. The sandbox
-// wraps that exec path in a stack of handlers, each in its own file:
+// mvdan/sh interprets only the shell *language*. Most external commands (uname,
+// tar, …) are delegated to a real host binary via os/exec; selected commands
+// such as those under tool/ run in-process. The sandbox wraps that exec path
+// in a stack of handlers, each in its own file:
 //
 //	sandbox.go    Config, Run, buildRunner — wiring + execution bound
 //	control.go    Disable (deny-list) and Mock (matchers → canned responses)
@@ -13,6 +14,7 @@
 //	allowlist.go  the command gate: allow-list, sensitive list, unlisted-runs-audited (+ the in-sandbox escape hatch)
 //	middleware.go sudo/env/timeout/… unwrapping + the sleep cap
 //	shinterp.go   `sh -c 'SCRIPT'` parsed & re-run confined
+//	internal/tool provides the portable in-process command implementations
 //	network.go    Policy; curl/wget served via net/http; the egress guard
 //	devnet.go     bash /dev/tcp + /dev/udp detection
 //	detection.go  CallHandler shims (downloader probe, typeset compat)
@@ -38,6 +40,7 @@ import (
 	"mvdan.cc/sh/v3/syntax"
 
 	"github.com/rezen/smash/internal/command"
+	"github.com/rezen/smash/internal/tool"
 )
 
 // DefaultTimeout is the wall-time bound Run applies when Config.Timeout is zero.
@@ -54,7 +57,7 @@ type OpenMiddleware = func(next interp.OpenHandlerFunc) interp.OpenHandlerFunc
 // the zero value is usable but blocks every URL and runs every command
 // unlisted (set Strict, or Allowed/Sensitive, to gate them).
 type Config struct {
-	Root      string         // the sandbox directory: binaries resolving inside it may run
+	Root      string         // the sandbox directory; native binaries inside still require AllowInRootExecutables
 	Dir       string         // initial working directory
 	Env       expand.Environ // the script's environment (HOME/PATH should point inside Root)
 	Network   Policy         // URL allow-list, redirect/timeout/size policy, injected headers
@@ -65,6 +68,11 @@ type Config struct {
 	Mocks     []*Mock        // canned responses by matcher, checked before anything runs (see Mock)
 	Emulation Emulation      // optional target-OS emulation; zero value = off
 	Timeout   time.Duration  // wall-time bound for one Run; zero = DefaultTimeout
+	// Profile observes a script without enforcing Smash's command, mock,
+	// downloader, egress, sleep, or raw-socket policy layers. External commands
+	// and network clients run directly; use only with separate OS confinement or
+	// a script trusted enough to execute unrestricted.
+	Profile bool
 
 	// AllowSudo answers sudo/doas credential probes (`sudo -v`, `sudo -n -l
 	// mkdir`, `sudo -K`) as if the user had passwordless sudo, so an installer
@@ -73,10 +81,20 @@ type Config struct {
 	// falls to the allow-list, which blocks it.
 	AllowSudo bool
 
+	// AllowInRootExecutables permits native binaries that resolve inside Root.
+	// It is deliberately off by default: native code runs outside the command,
+	// filesystem and network model. Shell scripts remain interpreted confined,
+	// and scripts for an explicitly allowed interpreter remain gated by it.
+	AllowInRootExecutables bool
+
 	Stdin          io.Reader
 	Stdout, Stderr io.Writer // nil = discard
-	Auditor        Auditor   // nil = off; else receives one AuditRecord per exec, plus one OpenRecord per redirection if it is an OpenAuditor (see TextAuditor)
-	AuditData      int       // bytes of stdin/stdout captured per command into each record; 0 = none
+	// ControllingTTY, when set, is the PTY interactive external commands should
+	// acquire as /dev/tty. Their ordinary stdin/stdout/stderr still come from
+	// the fields above, including shell pipelines and redirections.
+	ControllingTTY *os.File
+	Auditor        Auditor // nil = off; else receives one AuditRecord per exec, plus one OpenRecord per redirection if it is an OpenAuditor (see TextAuditor)
+	AuditData      int     // bytes of stdin/stdout captured per command into each record; 0 = none
 
 	Args []string // positional parameters ($1…) for the script
 
@@ -125,6 +143,12 @@ func (cfg Config) normalized() Config {
 // Run parses src as bash and executes it under cfg, bounded by cfg.Timeout.
 // name labels parse errors and diagnostics.
 func Run(cfg Config, name, src string) error {
+	return RunContext(context.Background(), cfg, name, src)
+}
+
+// RunContext is Run with cancellation controlled by the caller. Config.Timeout
+// remains an upper bound and is layered over ctx.
+func RunContext(ctx context.Context, cfg Config, name, src string) error {
 	cfg = cfg.normalized()
 	cfg.Posix = cfg.Posix || shebangIsSh(src)
 	prog, err := parseBash(name, src)
@@ -135,7 +159,7 @@ func Run(cfg Config, name, src string) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
+	ctx, cancel := context.WithTimeout(ctx, cfg.Timeout)
 	defer cancel()
 	return runner.Run(ctx, prog)
 }
@@ -221,7 +245,7 @@ func (e bashEnviron) Each(fn func(name string, vr expand.Variable) bool) {
 }
 
 // buildRunner assembles the interp.Runner. Exec middlewares compose outer→inner:
-// unwrap wrappers → [audit] → [deny] → [sudo grant] → [mock] → cap sleeps → confine `sh -c` and in-root shell
+// unwrap wrappers → [audit] → [deny] → [sudo grant] → [mock] → safe git version probe → cap sleeps → confine `sh -c` and in-root shell
 // scripts → [emulated uname] → serve
 // curl/wget → egress guard → command gate (allow-list / sensitive / in-root / unlisted). The CallHandler shims a couple of
 // builtins; the Open/Stat/Access handlers cover emulated files, /dev/tcp and
@@ -232,33 +256,61 @@ func buildRunner(cfg Config) (*interp.Runner, error) {
 	if cfg.Auditor != nil {
 		mws = append(mws, auditMiddleware(cfg.Auditor, cfg.AuditData)) // record the real command
 	}
-	if len(cfg.Denied) > 0 {
+	if !cfg.Profile && len(cfg.Denied) > 0 {
 		mws = append(mws, denyMiddleware(cfg.Denied)) // disabled commands never run
 	}
-	if cfg.AllowSudo {
+	if cfg.AllowSudo || cfg.Profile {
 		mws = append(mws, sudoGrantMiddleware) // sudo probes succeed (after deny: -disable sudo wins)
 	}
-	if len(cfg.Mocks) > 0 {
+	if !cfg.Profile && len(cfg.Mocks) > 0 {
 		mws = append(mws, mockMiddleware(cfg.Mocks)) // canned stdout/stderr/exit by matcher
 	}
+	if !cfg.Profile {
+		mws = append(mws,
+			gitVersionMiddleware(resolveHostCommandPath(cfg, "git")), // safe presence probe; real git remains sensitive
+			sleepCapMiddleware(time.Second/5),                        // no script burns real wall-time
+		)
+	}
 	mws = append(mws,
-		sleepCapMiddleware(time.Second/5), // no script burns real wall-time
-		shInterpMiddleware(cfg),           // parse & confine `sh -c 'SCRIPT'`
+		shInterpMiddleware(cfg), // parse `sh -c` so nested commands remain visible
+		tool.Mktemp,             // create temporary paths in-process, honoring the runner's TMPDIR
+		tool.SHA256Sum,          // portable hashing/checking, even when the host has no sha256sum
+		tool.Base64,             // portable encoding/decoding with GNU and BSD decode flags
 	)
 	if e.UnameOS != "" {
 		mws = append(mws, unameMiddleware(e))
 	}
-	mws = append(mws,
-		httpMiddleware(cfg.Network, cfg.Root), // curl/wget → net/http (allow-list), writing inside the root
-		egressGuardMiddleware(cfg.Network),    // openssl/ssh/nc/git egress (parser-driven)
-		allowListMiddleware(gate{ // the command gate
-			root: cfg.Root, allowed: cfg.Allowed, sensitive: cfg.Sensitive,
-			denied: cfg.Denied, strict: cfg.Strict, interpret: confinedScriptRunner(cfg),
-		}),
-	)
-	opens := []OpenMiddleware{
-		netDetectOpenMiddleware(cfg.Stderr), // inner: raw sockets
-		virtualOpenMiddleware(e),            // emulated files first
+	if !cfg.Profile {
+		httpMW, err := httpMiddleware(cfg.Network, cfg.Root)
+		if err != nil {
+			return nil, err
+		}
+		mws = append(mws,
+			httpMW,                             // curl/wget → net/http (allow-list), writing inside the root
+			egressGuardMiddleware(cfg.Network), // openssl/ssh/nc/git egress (parser-driven)
+		)
+	}
+	if !cfg.Profile {
+		mws = append(mws,
+			allowListMiddleware(gate{ // the command gate
+				root: cfg.Root, allowed: cfg.Allowed, sensitive: cfg.Sensitive,
+				denied: cfg.Denied, strict: cfg.Strict,
+				allowInRootExecutables: cfg.AllowInRootExecutables,
+				allowedPaths:           resolveAllowedPaths(cfg),
+				interpret:              confinedScriptRunner(cfg),
+			}),
+		)
+	}
+	if cfg.ControllingTTY != nil {
+		mws = append(mws, controllingTTYMiddleware(cfg.ControllingTTY))
+	}
+	var opens []OpenMiddleware
+	if !cfg.Profile {
+		opens = append(opens, netDetectOpenMiddleware(cfg.Stderr)) // inner: raw sockets
+	}
+	opens = append(opens, virtualOpenMiddleware(e)) // emulated files first
+	if cfg.ControllingTTY != nil {
+		opens = append(opens, controllingTTYOpenMiddleware(cfg.ControllingTTY))
 	}
 	if oa, ok := cfg.Auditor.(OpenAuditor); ok {
 		opens = append(opens, auditOpenMiddleware(oa)) // outer: record every redirection/source with its outcome
@@ -267,6 +319,7 @@ func buildRunner(cfg Config) (*interp.Runner, error) {
 	opts := []interp.RunnerOption{
 		interp.Env(bashEnviron{cfg.Env, cfg.Posix}),
 		interp.Dir(cfg.Dir),
+		interp.IgnoreErrexit(cfg.Profile),
 		interp.StdIO(cfg.Stdin, cfg.Stdout, cfg.Stderr),
 		interp.ExecHandlers(mws...),
 		interp.CallHandler(detectionCallHandler),
@@ -296,17 +349,9 @@ func chainOpen(base interp.OpenHandlerFunc, mws ...OpenMiddleware) interp.OpenHa
 // audit record carry the reason even when the script discards stderr
 // (`curl … >/dev/null 2>&1 &` is a common installer idiom). It unwraps to
 // interp.ExitStatus, so the interpreter still sees a plain exit code.
-type Failure struct {
-	Code int
-	Msg  string
-}
-
-func (f *Failure) Error() string { return f.Msg }
-func (f *Failure) Unwrap() error { return interp.ExitStatus(f.Code) }
+type Failure = tool.Failure
 
 // failf reports a diagnostic to w and returns it as a Failure with the exit status.
 func failf(w io.Writer, code int, format string, args ...any) error {
-	msg := fmt.Sprintf(format, args...)
-	fmt.Fprintln(w, msg)
-	return &Failure{Code: code, Msg: msg}
+	return tool.Failf(w, code, format, args...)
 }

@@ -3,6 +3,7 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"errors"
 	"regexp"
 	"strings"
 	"testing"
@@ -68,6 +69,22 @@ func TestExecutionTimeout(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Errorf("timeout took too long to fire: %v", elapsed)
+	}
+}
+
+func TestRunContextCancellation(t *testing.T) {
+	root := t.TempDir()
+	cfg := NewConfig(root, root, expand.ListEnviron("PATH=/usr/bin:/bin"))
+	cfg.Timeout = 10 * time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+	start := time.Now()
+	err := RunContext(ctx, cfg, "cancel.sh", `while true; do :; done`)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunContext error = %v, want context cancellation", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("RunContext cancellation took %v", elapsed)
 	}
 }
 

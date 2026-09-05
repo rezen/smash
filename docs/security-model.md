@@ -10,10 +10,10 @@ filesystem, or network namespace.
 | Area | Enforced by `smash` | Important limitation |
 |---|---|---|
 | Shell language | Parsed and interpreted in-process | Compatibility follows the patched `mvdan/sh` interpreter, not a host Bash process |
-| Commands | Sensitive and disabled commands are blocked; strict mode requires allow-listing | Allowed commands are real host binaries |
+| Commands | Sensitive and disabled commands are blocked; strict mode requires allow-listing | Allowed commands are real host binaries; trusted paths are snapshotted before the script changes `PATH` |
 | `curl` and `wget` | In-process HTTP client with URL, method, redirect, timeout, and size policy | The URL initially supplied as `SCRIPT` is fetched before the run |
 | Other network commands | Parsed egress intent is checked for modelled command families | An unmodelled client can run in non-strict mode |
-| Filesystem | Runner-controlled download outputs are confined; `HOME` and `TMPDIR` point into the root | A permitted host binary can write outside it |
+| Filesystem | Runner-controlled download outputs are confined; in-process `mktemp` honors `TMPDIR`; `HOME` and `TMPDIR` point into the root | A permitted host binary can write outside it |
 | Visibility | Commands, shell opens, resources, file changes, and optional data are audited | Descriptions reflect the command model, not kernel-level system-call tracing |
 
 For an untrusted script, enable `-strict` and allow only the commands needed by
@@ -23,12 +23,15 @@ that installer. Add OS-level confinement when host-level isolation matters.
 
 `mvdan/sh` interprets the shell language. External commands such as `uname`,
 `tar`, and `sed` are delegated to host executables through `os/exec` after the
-policy stack has inspected them.
+policy stack has inspected them. `base64`, `mktemp`, `sha256sum`, `curl`, and
+`wget` have implementations under `internal/tool` that run in-process.
 
 The runner sets `HOME`, `TMPDIR`, and the leading `PATH` entry inside the run
-root. It also exposes Bash/POSIX compatibility variables needed by common
-installers. These settings guide well-behaved tools into the root but do not
-prevent a host executable from naming and modifying another absolute path.
+root. Its `mktemp` implementation reliably uses that `TMPDIR` when a template
+does not name a directory, independent of host GNU/BSD behavior. It also
+exposes Bash/POSIX compatibility variables needed by common installers. These
+settings guide well-behaved tools into the root but do not prevent a host
+executable from naming and modifying another absolute path.
 
 ## Command policy
 
@@ -52,12 +55,13 @@ The explicit disable list wins over mocks and allow-list entries.
 
 ## Programs installed inside the root
 
-An installer must usually execute the binary it just installed. A program that
-resolves inside the run root can therefore execute and is marked `in-root: true`
-in the audit record.
+Resolving below the run root is not permission to execute opaque native code.
+Native executables are blocked by default, including in strict mode, and can be
+enabled only with the explicit `allow-in-root` capability. When enabled they
+are marked `in-root: true` in the audit record and run outside the command and
+network model.
 
-This is not an unrestricted escape hatch. Policy is based on the executable
-that will actually interpret the file:
+Interpreted files remain governed by the executable that will interpret them:
 
 - a script with `#!/usr/bin/env python3` is treated as `python3`, which is
   sensitive until allowed;
@@ -65,9 +69,10 @@ that will actually interpret the file:
 - commands executed by that shell script pass through the same middleware
   stack again.
 
-A newly installed opaque native binary remains a real process. Known package
-manager and network subcommands are inspected by argv, but this is not a
-substitute for OS isolation.
+The command gate checks the resolved in-root location before applying a basename
+allow-list entry, and allowed host commands are resolved against a PATH snapshot
+taken before script execution. A payload cannot therefore inherit an allow-list
+grant merely by naming itself `uname` or shadowing that name in `PATH`.
 
 ## Shell strings and wrappers
 
@@ -100,10 +105,12 @@ executed by a configurable Go `http.Client`, allowing `smash` to enforce:
 
 - structural URL-prefix matching;
 - an HTTP method allow-list;
+- a request-body limit and root-confined `@file` inputs;
 - a response-body limit;
 - per-request timeouts;
 - injected headers;
 - proxy and TLS behavior supplied by the configured transport;
+- a configurable DNS resolver, defaulting to Quad9's malware-blocking service;
 - the same policy on every redirect hop.
 
 URL prefixes are not raw string prefixes. The scheme and hostname match
@@ -123,6 +130,12 @@ The output path of in-process `curl -o` or `wget -O` must remain inside the run
 root. This is a real filesystem guarantee because `smash` itself performs that
 write.
 
+The DNS default adds a reputation-based block before connection, but it is not
+a hard security boundary: ordinary DNS is unencrypted, an HTTP proxy may
+resolve destinations itself, and explicitly allowed host binaries use their
+own resolver behavior. `-dns-server ""` selects the system resolver; a policy's
+`network.dns-server` can name another IP and optional port.
+
 ## General egress guard
 
 Downloaders are not the only network clients. A command-family registry parses
@@ -135,9 +148,17 @@ when possible, which destination. A shared egress guard then applies the
 appropriate policy. Offline operations remain usable—for example, `openssl
 dgst` does not egress while `openssl s_client -connect …` does.
 
-Git uses `git-hosts`, independently of downloader URL prefixes. Named remotes
-are resolved through `.git/config` before checking the host. This prevents an
-apparently harmless `git fetch origin` from hiding an off-policy remote.
+Real Git is sensitive by default. The exact `git --version` probe is allowed so
+installers can detect it, but every functional Git invocation requires an
+explicit grant. This is necessary because Git aliases, hooks, helpers,
+submodules, command-line configuration, and repository configuration can spawn
+processes the in-process middleware cannot observe.
+
+For an explicitly granted Git process, `git-hosts` remains defense in depth:
+recognized remotes are checked, named remotes are resolved through
+`.git/config`, submodule operations fail closed, and command-line settings that
+rewrite URLs or select helpers are rejected. It is not a hard egress guarantee;
+use OS-level network confinement when running real Git against untrusted state.
 
 Interpreter `-c` and `-m` forms are inspected heuristically for network modules,
 URLs, and common socket patterns. A script file passed to Python, Perl, Ruby,
@@ -151,7 +172,7 @@ interpreter as a file open. An open-handler detects, audits, and denies these
 paths before a socket is created.
 
 This does not turn the process into a network namespace. A permitted, unmodelled
-native binary can still open a socket in non-strict mode.
+native binary can still open a socket, including when `allow-in-root` is set.
 
 ## Filesystem visibility
 
@@ -177,6 +198,27 @@ keys, and command-specific secret options—are redacted before logging. This is
 best-effort structural redaction; arbitrary secrets printed by a command can
 still appear when data capture is enabled. Choose the `audit.data` setting and
 log destination accordingly.
+
+## Profile manifests
+
+A profile manifest associates an observed command/host set with the profiling
+OS and binds it to the SHA-256 of the script bytes. Enforcing it rejects a
+different OS or changed script and turns the observed commands and exact hosts
+into strict grants. The hash does not establish who
+authored the script, and a profile is not a static proof of all possible
+behavior: different arguments, environment, platform, network responses, or
+timing may select branches that were not exercised.
+
+Profiling is intentionally non-enforcing so discovery is not truncated by a
+Smash policy decision. Command denials, strict mode, mocks, in-process download
+controls, egress controls, the sleep cap, in-root native executable checks, and
+the raw-socket guard are bypassed while audit collection remains active. This
+means sensitive commands and real network clients can run. Profile only trusted
+scripts or add an OS-level sandbox/container, review manifests before
+enforcement, and profile every execution variant that matters. Non-zero exits
+remain visible to the audit, conditionals, and AND/OR lists, but the interpreter
+ignores the `set -e` termination action so errexit cannot truncate discovery.
+`sudo` wrappers remain unwrapped and never grant real privilege.
 
 ## Hardening beyond in-process enforcement
 

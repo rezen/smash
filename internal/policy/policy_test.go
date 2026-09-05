@@ -69,11 +69,11 @@ func TestTemplateIsANoOp(t *testing.T) {
 	if len(got.Denied) != 0 || len(got.Mocks) != 0 {
 		t.Errorf("denied = %v, mocks = %d; want none", got.Denied.Names(), len(got.Mocks))
 	}
-	if got.Strict || got.AllowSudo || got.Posix {
+	if got.Strict || got.AllowSudo || got.AllowInRootExecutables || got.Posix {
 		t.Error("a boolean gate is on")
 	}
 	if got.Timeout != want.Timeout || got.Network.Timeout != want.Network.Timeout ||
-		got.Network.MaxResponse != want.Network.MaxResponse {
+		got.Network.MaxResponse != want.Network.MaxResponse || got.Network.DNSServer != want.Network.DNSServer {
 		t.Error("a bound changed")
 	}
 	if got.Emulation.UnameOS != "" || got.Emulation.UnameArch != "" || len(got.Emulation.Files) != 0 {
@@ -108,7 +108,7 @@ func TestTemplateUncomments(t *testing.T) {
 	if f.Script == "" || len(f.Args) == 0 {
 		t.Errorf("script/args = %q %v", f.Script, f.Args)
 	}
-	if f.Strict == nil || f.AllowSudo == nil || f.Posix == nil {
+	if f.Strict == nil || f.AllowSudo == nil || f.AllowInRoot == nil || f.Posix == nil {
 		t.Error("a boolean key did not land in its field")
 	}
 	if f.Timeout == nil || time.Duration(*f.Timeout) != 2*time.Minute {
@@ -128,8 +128,14 @@ func TestTemplateUncomments(t *testing.T) {
 	if n.MaxResponse == nil || int64(*n.MaxResponse) != 200<<20 {
 		t.Errorf("max-response = %v", n.MaxResponse)
 	}
+	if n.MaxRequest == nil || int64(*n.MaxRequest) != 8<<20 {
+		t.Errorf("max-request = %v", n.MaxRequest)
+	}
 	if n.Timeout == nil || time.Duration(*n.Timeout) != 60*time.Second {
 		t.Errorf("network timeout = %v", n.Timeout)
+	}
+	if n.DNSServer == nil || *n.DNSServer != sandbox.DefaultDNSServer {
+		t.Errorf("dns-server = %v", n.DNSServer)
 	}
 	if f.Emulation == nil || f.Emulation.UnameOS != "Linux" || f.Emulation.UnameArch != "x86_64" {
 		t.Errorf("emulation = %+v", f.Emulation)
@@ -140,6 +146,8 @@ func TestTemplateUncomments(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.Timeout != want.Timeout || cfg.Network.MaxResponse != want.Network.MaxResponse ||
+		cfg.Network.MaxRequest != want.Network.MaxRequest ||
+		cfg.Network.DNSServer != want.Network.DNSServer ||
 		!slices.Equal(cfg.Network.GitHosts, want.Network.GitHosts) ||
 		len(cfg.Network.AllowedMethods) != len(want.Network.AllowedMethods) {
 		t.Error("the documented defaults do not match the sandbox defaults")
@@ -150,6 +158,7 @@ func TestApplyFull(t *testing.T) {
 	cfg := applied(t, `
 strict: true
 allow-sudo: true
+allow-in-root: true
 posix: true
 timeout: 90s
 commands:
@@ -164,7 +173,9 @@ network:
   git-hosts: [git.example.com]
   methods: [get, head, post]
   max-response: 1MiB
+  max-request: 64KiB
   timeout: 5s
+  dns-server: 1.1.1.2
   headers:
     Authorization: Bearer t0ken
 emulation:
@@ -173,7 +184,7 @@ emulation:
   files:
     /etc/os-release: "ID=ubuntu\n"
 `)
-	if !cfg.Strict || !cfg.AllowSudo || !cfg.Posix {
+	if !cfg.Strict || !cfg.AllowSudo || !cfg.AllowInRootExecutables || !cfg.Posix {
 		t.Error("boolean gates not set")
 	}
 	if cfg.Timeout != 90*time.Second {
@@ -199,8 +210,11 @@ emulation:
 	if !cfg.Network.AllowedMethods["POST"] || len(cfg.Network.AllowedMethods) != 3 {
 		t.Errorf("methods = %v, want the three upper-cased", cfg.Network.AllowedMethods)
 	}
-	if cfg.Network.MaxResponse != 1<<20 || cfg.Network.Timeout != 5*time.Second {
-		t.Errorf("caps = %d / %v", cfg.Network.MaxResponse, cfg.Network.Timeout)
+	if cfg.Network.MaxResponse != 1<<20 || cfg.Network.MaxRequest != 64<<10 || cfg.Network.Timeout != 5*time.Second {
+		t.Errorf("caps = response %d / request %d / %v", cfg.Network.MaxResponse, cfg.Network.MaxRequest, cfg.Network.Timeout)
+	}
+	if cfg.Network.DNSServer != "1.1.1.2" {
+		t.Errorf("dns-server = %q", cfg.Network.DNSServer)
 	}
 	if cfg.Network.InjectHeaders["Authorization"] != "Bearer t0ken" {
 		t.Errorf("headers = %v", cfg.Network.InjectHeaders)
@@ -515,7 +529,7 @@ func TestREADMEExample(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const heading = "## The policy file"
+	const heading = "## Policy files"
 	_, after, ok := strings.Cut(string(b), heading)
 	if !ok {
 		t.Fatalf("README has no %q section", heading)

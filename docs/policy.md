@@ -21,6 +21,7 @@ root: sandbox
 timeout: 2m
 strict: false
 allow-sudo: false
+allow-in-root: false
 
 env:
   NO_COLOR: "1"
@@ -44,7 +45,9 @@ network:
   git-hosts: [github.com]
   methods: [GET, HEAD]
   max-response: 200MiB
+  max-request: 8MiB
   timeout: 60s
+  dns-server: 9.9.9.9:53
   headers:
     Authorization: Bearer REDACTED
 
@@ -79,6 +82,7 @@ mocks:
 | `timeout` | Wall-time limit for the complete script |
 | `strict` | Deny commands that are not allow-listed |
 | `allow-sudo` | Answer sudo/doas credential probes without escalating commands |
+| `allow-in-root` | Permit native executables below the root; an explicit unsafe capability |
 | `posix` | Run the script as POSIX `sh` rather than Bash mode |
 | `env` | Environment entries layered over the runner's defaults |
 
@@ -101,7 +105,8 @@ optional captured data. Secrets recognized by the command model are redacted.
 ## Command settings
 
 - `allow` widens the default allow-list. It is also how a sensitive command
-  such as `python3` is deliberately permitted.
+  such as `python3` or real `git` is deliberately permitted. The exact `git
+  --version` availability probe remains usable without granting Git.
 - `disable` is an unconditional deny-list. It applies after wrappers are
   resolved, so it also catches forms such as `sudo rm`, `find -exec rm`, and
   `sh -c 'rm …'`. A disabled command cannot be restored by a mock.
@@ -118,14 +123,26 @@ must agree, and paths match on whole-segment boundaries. Redirects are checked
 at every hop.
 
 `github: true` appends the GitHub API, raw, codeload, objects, and release-asset
-hosts. `git-hosts` separately controls Git over every transport. URL prefixes do
-not grant Git access because allowing an HTTP download and allowing repository
-fetches or pushes are different permissions.
+hosts. Real Git is sensitive by default because aliases, helpers, hooks,
+submodules, and repository configuration can create work outside the
+in-process middleware. If Git is explicitly allow-listed, `git-hosts` applies
+defense-in-depth checks to recognized remotes, but it is not an OS-level egress
+boundary. URL prefixes do not grant Git access.
 
-`methods`, `max-response`, and `timeout` replace the downloader defaults.
-Response sizes accept bytes or units such as `KiB`, `MiB`, `GB`, and `GiB`.
+`methods`, `max-response`, `max-request`, and `timeout` replace the downloader
+defaults. Request and response sizes accept bytes or units such as `KiB`,
+`MiB`, `GB`, and `GiB`. Curl data flags are sent under the request cap; `@file`
+inputs must resolve inside the run root.
 `headers` injects values into every in-process request, which can keep a broker
 token out of the installer source.
+
+`dns-server` selects an IP address and optional port for HTTP hostname lookups.
+It defaults to Quad9's malware-blocking, DNSSEC-validating resolver at
+`9.9.9.9:53`. Set `dns-server: ""` to use the host's system resolver, or replace
+it with another resolver such as `1.1.1.2:53`. The setting applies to the
+initial remote script fetch and to in-process `curl`/`wget`; it does not control
+DNS performed by explicitly allowed host binaries or by an HTTP proxy. Queries
+to this resolver use ordinary unencrypted DNS.
 
 An explicitly empty `urls: []` means deny every fetch. A key with no value,
 such as an unfinished `urls:`, is null and leaves the defaults unchanged.

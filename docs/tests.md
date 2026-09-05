@@ -9,6 +9,10 @@ interception, and the sandbox against a **second** real installer,
 [`rvm-installer`](../fixtures/rvm-installer) — a much heavier bash script (arrays,
 `[[ ]]`, `extglob`, `errtrace`, backslash-escaped commands).
 
+Security regressions also pin ownership-marker root cleanup, strict-mode denial
+of native in-root binaries and PATH shadows, explicit Git grants and rewrite
+denials, and bounded curl request bodies.
+
 ## Running them
 
 ```bash

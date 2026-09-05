@@ -117,7 +117,7 @@ func TestNVMScriptInstallAuditTrail(t *testing.T) {
 
 // TestNVMGitInstallHeldByEgressGuard: with git on the host, nvm prefers
 // `git clone https://github.com/nvm-sh/nvm.git`. git runs for real, so the
-// only gate on where it talks to is Policy.GitHosts — clear it and the clone
+// parsed host gate is Policy.GitHosts — clear it and the clone
 // is refused before it reaches the network, and nvm exits with nothing
 // installed. (With the default GitHosts, GitHub is allowed and the clone would
 // really happen; that is the policy's job, not the allow-list's.)

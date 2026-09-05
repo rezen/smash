@@ -5,7 +5,7 @@ enforcement, and user-facing configuration into a CLI and three internal
 packages:
 
 ```text
-cmd/smash          CLI, script loading, root setup, flag precedence
+cmd/smash          CLI, script loading, root setup, flag precedence, PTY-backed tview UI
 internal/policy    YAML schema, validation, and template generation
 internal/command   pure argv parsing and command capabilities
 internal/sandbox   mvdan/sh runner, enforcement middleware, and auditing
@@ -24,7 +24,7 @@ shell AST
   → apply disable rules and mocks
   → reinterpret shell runners when needed
   → apply downloader, egress, and command gates
-  → execute in-process behavior or a host binary
+  → execute in-process behavior or a host binary (attached to the script PTY when interactive)
   → record resources, file changes, streams, and result
 ```
 
@@ -152,14 +152,18 @@ A single guard consumes that description rather than embedding network policy
 in every middleware branch. This keeps offline and online forms of a tool
 distinct.
 
-Git receives special treatment: named remotes are resolved from `.git/config`,
-and `Policy.GitHosts` is separate from downloader URL prefixes. `/dev/tcp` and
-`/dev/udp` are detected in the interpreter's file-open path because they never
-become external commands.
+Git is sensitive by default because a real Git process can launch aliases,
+helpers, hooks and transports outside the middleware. When explicitly granted,
+named remotes are resolved from `.git/config`, dangerous command-line rewrites
+and submodule operations fail closed, and `Policy.GitHosts` supplies advisory
+checks separate from downloader URL prefixes. `/dev/tcp` and `/dev/udp` are
+detected in the interpreter's file-open path because they never become external
+commands.
 
 `curl` and `wget` additionally implement `Downloader`. Their request objects are
-executed by the in-process HTTP layer, which rechecks redirects and confines
-runner-controlled output files.
+executed by `internal/tool`, using the policy-configured HTTP client to
+recheck redirects, bound request and response bodies, and confine
+runner-controlled input and output files.
 
 See the [security model](security-model.md) for the guarantees and limits of
 these mechanisms.

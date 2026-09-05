@@ -33,10 +33,11 @@ type File struct {
 	Script string   `yaml:"script"`
 	Args   []string `yaml:"args"`
 
-	Strict    *bool     `yaml:"strict"`
-	AllowSudo *bool     `yaml:"allow-sudo"`
-	Posix     *bool     `yaml:"posix"`
-	Timeout   *Duration `yaml:"timeout"`
+	Strict      *bool     `yaml:"strict"`
+	AllowSudo   *bool     `yaml:"allow-sudo"`
+	AllowInRoot *bool     `yaml:"allow-in-root"`
+	Posix       *bool     `yaml:"posix"`
+	Timeout     *Duration `yaml:"timeout"`
 
 	Env map[string]string `yaml:"env"`
 
@@ -72,7 +73,9 @@ type Network struct {
 	GitHosts    Strings           `yaml:"git-hosts"`    // replaces the default forges when present
 	Methods     Strings           `yaml:"methods"`      // replaces the default GET/HEAD when present
 	MaxResponse *Size             `yaml:"max-response"` // bytes, or a size like "200MiB"
+	MaxRequest  *Size             `yaml:"max-request"`  // request-body bytes, or a size like "8MiB"
 	Timeout     *Duration         `yaml:"timeout"`
+	DNSServer   *string           `yaml:"dns-server"` // IP[:port]; empty restores the system resolver
 	Headers     map[string]string `yaml:"headers"`
 }
 
@@ -163,6 +166,7 @@ func (f *File) Apply(cfg *sandbox.Config) error {
 	}
 	setBool(&cfg.Strict, f.Strict)
 	setBool(&cfg.AllowSudo, f.AllowSudo)
+	setBool(&cfg.AllowInRootExecutables, f.AllowInRoot)
 	setBool(&cfg.Posix, f.Posix)
 	if f.Timeout != nil {
 		cfg.Timeout = time.Duration(*f.Timeout)
@@ -201,8 +205,14 @@ func (f *File) Apply(cfg *sandbox.Config) error {
 		if n.MaxResponse != nil {
 			cfg.Network.MaxResponse = int64(*n.MaxResponse)
 		}
+		if n.MaxRequest != nil {
+			cfg.Network.MaxRequest = int64(*n.MaxRequest)
+		}
 		if n.Timeout != nil {
 			cfg.Network.Timeout = time.Duration(*n.Timeout)
+		}
+		if n.DNSServer != nil {
+			cfg.Network.DNSServer = *n.DNSServer
 		}
 		if len(n.Headers) > 0 {
 			if cfg.Network.InjectHeaders == nil {

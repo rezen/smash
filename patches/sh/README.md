@@ -17,10 +17,21 @@ A fresh clone will not build until this has run once. The upstream licence
 (`third_party/sh/LICENSE`) applies to the generated tree.
 
 `handlerctx.patch` is a one-hunk diff against `interp/handler.go`; see Patch 7.
+`tty.patch` lets Smash mark a PTY as an external command's controlling terminal;
+see Patch 8.
 `smash.patch` is a single unified diff against `interp/api.go`,
 `interp/runner.go`, `interp/test.go` and `expand/param.go` (the logical changes below share
 hunks, so they are not split). Every hunk is marked `smash patch` in the
 source.
+
+## Patch 8: controlling terminals for interactive child processes
+
+The split UI owns the physical terminal while scripts use a separate PTY.
+Standard descriptors alone are insufficient for programs that open `/dev/tty`
+directly. `tty.patch` adds `WithControllingTTY`, passes the marked PTY to the
+child as an extra descriptor, and configures Unix children as session leaders
+with that descriptor as their controlling terminal. Non-Unix builds keep the
+marker as a no-op.
 
 ## Patch 1: file descriptors beyond 0/1/2
 

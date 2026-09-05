@@ -23,6 +23,17 @@ type Request struct {
 	FailOnHTTP bool   // fail on HTTP status >= 400 (curl -f)
 	Head       bool   // HEAD request, print headers (curl -I)
 	WriteOut   string // curl -w: format printed to stdout after the transfer
+	Body       []RequestBodyPart
+}
+
+// RequestBodyPart is one curl data flag. File names are resolved and confined
+// by the sandbox package, not read by the pure command model.
+type RequestBodyPart struct {
+	Value         string
+	Prefix        string
+	File          bool
+	StripNewlines bool
+	URLEncode     bool
 }
 
 // Downloader is implemented by fetchers whose invocation can be served
@@ -60,7 +71,14 @@ func (Curl) Names() []string                       { return []string{"curl"} }
 func (Curl) Parse(a []string) ParsedCommand        { return curlSpec.Parse(a) }
 func (Curl) Egress(p ParsedCommand) (string, bool) { return urlOperand(p) }
 func (Curl) Params(p ParsedCommand) Params         { return curlParamsFrom(p) }
-func (Curl) Request(p ParsedCommand) Request       { return curlParamsFrom(p).Request() }
+func (Curl) Request(p ParsedCommand) Request {
+	r := curlParamsFrom(p).Request()
+	r.Body = curlBodyParts(p)
+	if len(r.Body) > 0 && r.Method == "" {
+		r.Method = "POST"
+	}
+	return r
+}
 
 // Request converts the typed params to a fetch intent.
 func (c CurlParams) Request() Request {
@@ -87,10 +105,47 @@ func (c CurlParams) Request() Request {
 	for _, ck := range c.Cookies {
 		r.Headers.Add("Cookie", ck)
 	}
-	if c.Data != "" && r.Method == "" {
+	for _, value := range c.Data {
+		r.Body = append(r.Body, RequestBodyPart{Value: value, StripNewlines: true})
+	}
+	if len(c.Data) > 0 && r.Method == "" {
 		r.Method = "POST"
 	}
 	return r
+}
+
+func curlBodyParts(p ParsedCommand) []RequestBodyPart {
+	var parts []RequestBodyPart
+	add := func(values []string, raw, binary, encoded bool) {
+		for _, value := range values {
+			part := RequestBodyPart{Value: value, StripNewlines: !binary, URLEncode: encoded}
+			if !raw && strings.HasPrefix(value, "@") {
+				part.File = true
+				part.Value = strings.TrimPrefix(value, "@")
+			}
+			parts = append(parts, part)
+		}
+	}
+	add(p.Values("-d", "--data"), false, false, false)
+	add(p.Values("--data-raw"), true, false, false)
+	add(p.Values("--data-binary"), false, true, false)
+	for _, value := range p.Values("--data-urlencode") {
+		part := RequestBodyPart{URLEncode: true}
+		switch {
+		case strings.HasPrefix(value, "@"):
+			part.File, part.Value = true, strings.TrimPrefix(value, "@")
+		case strings.Contains(value, "="):
+			name, content, _ := strings.Cut(value, "=")
+			part.Prefix, part.Value = name+"=", content
+		case strings.Contains(value, "@"):
+			name, file, _ := strings.Cut(value, "@")
+			part.Prefix, part.Value, part.File = name+"=", file, true
+		default:
+			part.Value = value
+		}
+		parts = append(parts, part)
+	}
+	return parts
 }
 
 // Wget ----------------------------------------------------------------------
@@ -245,7 +300,7 @@ var (
 	gitSpec = Spec{Subcommand: true, ValueFlags: NewSet(
 		"-C", "-c", "--git-dir", "--work-tree", "--exec-path", "--namespace",
 		"--upload-pack", "--depth", "-o", "-b", "--branch")}
-	gitRemoteSubcommands = NewSet("clone", "fetch", "pull", "push", "ls-remote", "remote")
+	gitRemoteSubcommands = NewSet("clone", "fetch", "pull", "push", "ls-remote", "remote", "submodule")
 	// gitNamedRemote subcommands take the remote as their first operand and
 	// default to "origin" when it is omitted.
 	gitNamedRemote = NewSet("fetch", "pull", "push", "ls-remote")
@@ -263,6 +318,14 @@ func (Git) Parse(a []string) ParsedCommand { return gitSpec.Parse(a) }
 // unknown. `--all`/`--multiple` and `remote update` name no single remote and
 // report the subcommand itself.
 func (Git) Egress(p ParsedCommand) (string, bool) {
+	for _, setting := range p.Values("-c") {
+		if dangerousGitConfig(setting) {
+			return "unsafe git config", true
+		}
+	}
+	if p.Subcommand == "submodule" {
+		return "submodule", true // may read URLs and helpers from repository state
+	}
 	if !gitRemoteSubcommands[p.Subcommand] {
 		return "", false
 	}
@@ -278,6 +341,20 @@ func (Git) Egress(p ParsedCommand) (string, bool) {
 		return "origin", true
 	}
 	return p.Subcommand, true
+}
+
+// dangerousGitConfig identifies command-line settings that can rewrite a
+// checked remote, choose an arbitrary transport/helper, or execute a command.
+// Real git remains an explicit unsafe capability; this closes the common
+// textual-host bypasses for callers that nevertheless grant it.
+func dangerousGitConfig(setting string) bool {
+	key, _, _ := strings.Cut(strings.ToLower(setting), "=")
+	return strings.HasPrefix(key, "alias.") ||
+		strings.HasPrefix(key, "url.") && (strings.HasSuffix(key, ".insteadof") || strings.HasSuffix(key, ".pushinsteadof")) ||
+		strings.HasPrefix(key, "remote.") && (strings.HasSuffix(key, ".url") || strings.HasSuffix(key, ".pushurl") || strings.HasSuffix(key, ".vcs")) ||
+		key == "core.sshcommand" || key == "core.gitproxy" ||
+		key == "http.proxy" || key == "https.proxy" ||
+		key == "credential.helper" || strings.HasPrefix(key, "protocol.")
 }
 
 // Perl ----------------------------------------------------------------------
