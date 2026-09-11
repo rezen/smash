@@ -7,7 +7,7 @@ require (
 	github.com/gdamore/tcell/v2 v2.8.1
 	github.com/hinshun/vt10x v0.0.0-20220301184237-5011da428d02
 	github.com/rivo/tview v0.42.0
-	golang.org/x/sys v0.47.0
+	golang.org/x/sys v0.48.0
 	golang.org/x/term v0.45.0
 	gopkg.in/yaml.v3 v3.0.1
 	mvdan.cc/sh/v3 v3.14.0
