@@ -6,18 +6,16 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"net"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strings"
 	"sync"
 
 	"gopkg.in/yaml.v3"
 
 	"github.com/rezen/smash/internal/command"
+	"github.com/rezen/smash/internal/hostname"
 	"github.com/rezen/smash/internal/sandbox"
 )
 
@@ -80,18 +78,11 @@ func (m Manifest) Validate() error {
 		}
 	}
 	for _, host := range m.Hosts {
-		if !validHost(host) {
+		if !hostname.Valid(host) {
 			return fmt.Errorf("invalid manifest host %q", host)
 		}
 	}
 	return nil
-}
-
-func validHost(host string) bool {
-	if host == "" || strings.ContainsAny(host, "/@ \\") {
-		return false
-	}
-	return !strings.Contains(host, ":") || net.ParseIP(host) != nil
 }
 
 // Load decodes a manifest and rejects unknown fields.
@@ -215,43 +206,14 @@ func (p *Profiler) Manifest() Manifest {
 	return m
 }
 
+// resourceHost extracts the host a network-ish resource touched, with the
+// SAME parser (hostname.FromEndpoint) Policy.AllowsTarget will use when this
+// manifest is later enforced — recording and matching cannot drift apart.
 func resourceHost(r command.Resource) string {
 	switch r.Kind {
 	case "url", "repo", "remote", "host", "socket", "keyserver":
 	default:
 		return ""
 	}
-	return targetHost(r.Value)
-}
-
-func targetHost(target string) string {
-	if strings.Contains(target, "://") {
-		u, err := url.Parse(target)
-		if err == nil {
-			return strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
-		}
-		return ""
-	}
-	rest := target
-	if i := strings.IndexByte(rest, '@'); i >= 0 {
-		rest = rest[i+1:]
-	}
-	if h := strings.Trim(rest, "[]"); net.ParseIP(h) != nil {
-		return strings.ToLower(h)
-	}
-	if strings.HasPrefix(rest, "[") {
-		if h, _, err := net.SplitHostPort(rest); err == nil {
-			return strings.ToLower(strings.TrimSuffix(h, "."))
-		}
-	}
-	if h, _, err := net.SplitHostPort(rest); err == nil {
-		return strings.ToLower(strings.TrimSuffix(h, "."))
-	}
-	if h, _, ok := strings.Cut(rest, ":"); ok {
-		rest = h
-	}
-	if strings.ContainsAny(rest, "/ ") {
-		return ""
-	}
-	return strings.ToLower(strings.TrimSuffix(rest, "."))
+	return hostname.FromEndpoint(r.Value)
 }

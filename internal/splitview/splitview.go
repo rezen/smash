@@ -50,15 +50,7 @@ type View struct {
 // Start prepares the TUI only for an interactive terminal using the
 // default audit stream. Piped and redirected runs keep ordinary CLI streams.
 func Start(stdin, stdout, stderr *os.File) (*View, bool, error) {
-	if stdin == nil || stdout == nil || stderr == nil ||
-		os.Getenv("TERM") == "" || os.Getenv("TERM") == "dumb" ||
-		!term.IsTerminal(int(stdin.Fd())) ||
-		!term.IsTerminal(int(stdout.Fd())) ||
-		!term.IsTerminal(int(stderr.Fd())) {
-		return nil, false, nil
-	}
-	width, height, err := term.GetSize(int(stdout.Fd()))
-	if err != nil || width < 40 || height < 8 {
+	if !isInteractiveTerminal(stdin, stdout, stderr) || !screenLargeEnough(stdout) {
 		return nil, false, nil
 	}
 
@@ -96,6 +88,30 @@ func Start(stdin, stdout, stderr *os.File) (*View, bool, error) {
 type readyScreen struct{ tcell.Screen }
 
 func (readyScreen) Init() error { return nil }
+
+// isInteractiveTerminal reports whether all three stdio streams are real
+// terminals with a capable TERM — the preconditions for taking over the
+// screen with tview. Piped, redirected and dumb-terminal runs fail it and
+// keep their ordinary streams.
+func isInteractiveTerminal(stdin, stdout, stderr *os.File) bool {
+	if stdin == nil || stdout == nil || stderr == nil {
+		return false
+	}
+	if t := os.Getenv("TERM"); t == "" || t == "dumb" {
+		return false
+	}
+	return term.IsTerminal(int(stdin.Fd())) &&
+		term.IsTerminal(int(stdout.Fd())) &&
+		term.IsTerminal(int(stderr.Fd()))
+}
+
+// screenLargeEnough: the split view needs room for two bordered panes and a
+// status line; below this, the plain stderr stream is more usable than a
+// squeezed TUI.
+func screenLargeEnough(stdout *os.File) bool {
+	width, height, err := term.GetSize(int(stdout.Fd()))
+	return err == nil && width >= 40 && height >= 8
+}
 
 func newSplitView(master, slave *os.File) *View {
 	app := tview.NewApplication().EnablePaste(true)

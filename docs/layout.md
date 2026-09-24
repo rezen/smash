@@ -51,7 +51,7 @@ internal/sandbox/   the enforcement stack on mvdan/sh
   audit.go      AuditRecord, Auditor, TextAuditor, stdin/stdout capture (Config.Auditor/AuditData)
   control.go    Disable (deny-list) and Mock + Matchers (canned stdout/stderr/exit)
   allowlist.go  DefaultAllowList + DefaultSensitiveList + the command gate (unlisted runs audited; Strict) / in-sandbox escape hatch, shebang-aware
-  middleware.go unwrap (+ the wrapper chain for the audit record) + sleep cap
+  middleware.go unwrap (+ the wrapper chain for the audit record), sudo-probe grant, git-version probe, sleep cap
   shinterp.go   confined interpretation of `sh -c` and of in-root shell scripts
   controlling_tty_unix.go   /dev/tty routing and controlling-PTY session handoff
   network.go    Policy (structural URL matching), HTTP client wiring, egress guard
@@ -61,6 +61,22 @@ internal/sandbox/   the enforcement stack on mvdan/sh
   fixups.go     AST rewrites where mvdan/sh and bash differ (subshell `return`)
   vars.go       RunVars (resolved variable table) + Assignments (static AST walk)
   *_test.go     egress, unwrap, redirects, rvm/get-docker containment
+
+internal/hostname/  one spelling of "extract the host from a target string"
+  hostname.go   FromEndpoint (shared by the Profiler and Policy.AllowsTarget so
+                recording and enforcement cannot drift), FromGitRemote, Valid
+
+internal/shebang/   `#!` line parsing, env indirection included
+  shebang.go    Interpreter, IsSh (POSIX-mode check), FromFile (the gate's
+                in-root interpreter check)
+
+internal/pathsafe/  "is this path inside that directory?" for untrusted paths
+  pathsafe.go   Within (symlink-resolving; nonexistent targets judged by their
+                deepest existing ancestor), LexicallyWithin
+
+internal/yamlenc/   YAML scalars a parser reads back byte-identically
+  yamlenc.go    Scalar + the named misread predicates behind it; used by
+                TextAuditor's streamed records
 
 internal/tool/   portable in-process command implementations
   base64.go      GNU/BSD-compatible encoding and decoding

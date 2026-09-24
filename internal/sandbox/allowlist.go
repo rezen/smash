@@ -19,7 +19,6 @@ package sandbox
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,6 +26,8 @@ import (
 	"mvdan.cc/sh/v3/interp"
 
 	"github.com/rezen/smash/internal/command"
+	"github.com/rezen/smash/internal/pathsafe"
+	"github.com/rezen/smash/internal/shebang"
 )
 
 // DefaultAllowList is a list of commands that installer
@@ -150,11 +151,12 @@ func allowListMiddleware(g gate) Middleware {
 				return next(ctx, args)
 			}
 			hc := interp.HandlerCtx(ctx)
+			if path := resolveInSandbox(hc, g.root, args[0]); path != "" {
+				return g.runFromRoot(ctx, next, hc, path, args)
+			}
 			allowed, sensitive, strict := g.allowed, g.sensitive, g.strict
 			name := filepath.Base(args[0])
 			switch {
-			case resolveInSandbox(hc, g.root, args[0]) != "":
-				return g.runFromRoot(ctx, next, hc, args)
 			case allowed[name]:
 				path := g.allowedPaths[name]
 				if path == "" {
@@ -198,9 +200,8 @@ func allowListMiddleware(g gate) Middleware {
 // some other interpreter, which is judged as if that interpreter had been
 // invoked directly, and a real binary, which needs the explicit
 // AllowInRootExecutables capability and is flagged InRoot.
-func (g gate) runFromRoot(ctx context.Context, execute interp.ExecHandlerFunc, hc interp.HandlerContext, args []string) error {
-	path := resolveInSandbox(hc, g.root, args[0])
-	via, hasShebang := shebangInterpreter(path)
+func (g gate) runFromRoot(ctx context.Context, execute interp.ExecHandlerFunc, hc interp.HandlerContext, path string, args []string) error {
+	via, hasShebang := shebang.FromFile(path)
 	name := filepath.Base(via)
 	if hasShebang {
 		// Denial comes first and is absolute, as it is everywhere else: an
@@ -255,7 +256,7 @@ func resolveHostCommandPath(cfg Config, name string) string {
 		}
 		candidate := filepath.Join(dir, name)
 		abs, err := filepath.Abs(candidate)
-		if err != nil || withinRoot(cfg.Root, abs) {
+		if err != nil || pathsafe.Within(cfg.Root, abs) {
 			continue
 		}
 		if info, err := os.Stat(abs); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
@@ -263,41 +264,6 @@ func resolveHostCommandPath(cfg Config, name string) string {
 		}
 	}
 	return ""
-}
-
-// shebangInterpreter returns the interpreter a file's `#!` line names. ok is
-// false for a binary, an unreadable file, or a script with no shebang (which
-// the kernel refuses and the shell would run itself).
-func shebangInterpreter(path string) (string, bool) {
-	if path == "" {
-		return "", false
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return "", false
-	}
-	defer f.Close()
-	buf := make([]byte, 256)
-	n, _ := io.ReadFull(f, buf)
-	line, _, _ := strings.Cut(string(buf[:n]), "\n")
-	rest, ok := strings.CutPrefix(line, "#!")
-	if !ok {
-		return "", false
-	}
-	fields := strings.Fields(rest)
-	if len(fields) == 0 {
-		return "", false
-	}
-	// `#!/usr/bin/env python3` runs python3; env itself decides nothing.
-	if filepath.Base(fields[0]) == "env" {
-		for _, f := range fields[1:] {
-			if !strings.HasPrefix(f, "-") && !strings.Contains(f, "=") {
-				return f, true
-			}
-		}
-		return "", false
-	}
-	return fields[0], true
 }
 
 // resolveInSandbox returns the absolute path a command resolves to when that
@@ -321,21 +287,25 @@ func resolveInSandbox(hc interp.HandlerContext, root, name string) string {
 		}
 	}
 	abs, err := filepath.Abs(resolved)
-	if err != nil || !withinRoot(root, abs) {
+	if err != nil || !pathsafe.Within(root, abs) {
 		return ""
 	}
 	return abs
 }
 
-// lookInSandboxPath returns the first executable match for name on the runner's
-// PATH that lives inside the sandbox, or "" if none.
+// lookInSandboxPath returns the first match for name on the runner's PATH
+// that lives inside the sandbox, or "" if none. Unlike resolveHostCommandPath
+// it deliberately does NOT require the execute bit: an in-root match is
+// judged by the gate (and a shell script interpreted confined) rather than
+// handed to the kernel, and skipping a chmod-less install here would misroute
+// it to the host-command path instead of the in-root one.
 func lookInSandboxPath(hc interp.HandlerContext, root, name string) string {
 	for _, dir := range filepath.SplitList(hc.Env.Get("PATH").String()) {
 		if dir == "" {
 			continue
 		}
 		abs, err := filepath.Abs(filepath.Join(dir, name))
-		if err != nil || !withinRoot(root, abs) {
+		if err != nil || !pathsafe.Within(root, abs) {
 			continue
 		}
 		if info, err := os.Stat(abs); err == nil && !info.IsDir() {
@@ -343,40 +313,4 @@ func lookInSandboxPath(hc interp.HandlerContext, root, name string) string {
 		}
 	}
 	return ""
-}
-
-// pathWithin reports whether abs is lexically inside root. It says nothing
-// about symlinks; withinRoot is the one to use on a path a script chose.
-func pathWithin(root, abs string) bool {
-	rel, err := filepath.Rel(root, abs)
-	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
-}
-
-// withinRoot reports whether target is inside root once symlinks are resolved
-// on both sides. The target itself need not exist — it is often a file about to
-// be created — so the deepest ancestor that does exist is what gets resolved:
-// a symlinked staging directory inside the root still counts as inside, and one
-// pointing out of it does not. Resolving root too is what makes this work on
-// macOS, where /var is a symlink to /private/var and the two spellings would
-// otherwise never match.
-func withinRoot(root, target string) bool {
-	realRoot, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		realRoot = root
-	}
-	dir := target
-	for {
-		if real, err := filepath.EvalSymlinks(dir); err == nil {
-			rest, err := filepath.Rel(dir, target)
-			if err != nil {
-				return false
-			}
-			return pathWithin(realRoot, filepath.Join(real, rest))
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return false
-		}
-		dir = parent
-	}
 }

@@ -152,6 +152,15 @@ A single guard consumes that description rather than embedding network policy
 in every middleware branch. This keeps offline and online forms of a tool
 distinct.
 
+Each egress target is classified before the guard judges it: a **URL** is
+matched against the URL prefix allow-list, an **endpoint** (host, host:port,
+user@host) against the allowed-hosts list, and an **indicator** — a target
+that names the networked operation rather than a place, such as `apt-get`'s
+`install`, `gpg --recv-keys`, or a Python module — is off-policy by
+definition, since no allow-list entry can name one. Most targets classify by
+shape; commands whose labels read like bare hostnames (`socket`, `install`,
+`s_client`) classify themselves.
+
 Git is sensitive by default because a real Git process can launch aliases,
 helpers, hooks and transports outside the middleware. When explicitly granted,
 named remotes are resolved from `.git/config`, dangerous command-line rewrites

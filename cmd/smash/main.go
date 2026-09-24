@@ -61,69 +61,40 @@ func main() {
 // The two sources compose in one direction: the policy file supplies the base,
 // and a flag the user actually typed overrides it. That is what makes
 // `smash -policy p.yaml -strict fixtures/x.sh` mean what it reads as, and it
-// is why the overrides below are keyed off fs.Visit (flags SET on the command
-// line) rather than off their values — -strict=false and an absent -strict have
-// the same value and must not have the same effect.
+// is why overrides are keyed off cliFlags.set (flags SET on the command line)
+// rather than off their values — -strict=false and an absent -strict have the
+// same value and must not have the same effect. Each helper owns one such
+// precedence decision end to end: resolveScriptArg the script+args unit,
+// effectiveDNS the resolver, buildConfig the Config layering, wireAudit the
+// audit sink.
 func runCLI(argv []string) error {
-	fs := flag.NewFlagSet("smash", flag.ContinueOnError)
-	policyPath := fs.String("policy", "", "read the run's policy from a YAML file; flags given here override it (see -init-policy)")
-	initPolicy := fs.String("init-policy", "", "write a commented boilerplate policy file here (\"-\" = stdout) and exit")
-	profile := fs.Bool("profile", false, "run the script and write its SHA-256 plus observed commands and hosts to a manifest")
-	profileOutput := fs.String("profile-output", "", "profile manifest path (default: <script>.manifest.yaml)")
-	manifestPath := fs.String("manifest", "", "verify the script hash and restrict the run to commands and hosts in this manifest")
-	urls := fs.String("urls", "", "comma-separated URL prefixes to allow (replaces the default)")
-	urlsGitHub := fs.Bool("urls-github", false, "also allow GitHub release downloads (github.com, api.github.com, raw/codeload/objects/release-assets hosts)")
-	gitHosts := fs.String("git-hosts", "", "comma-separated hosts git may reach (replaces the default github.com,gitlab.com,bitbucket.org)")
-	dnsServer := fs.String("dns-server", sandbox.DefaultDNSServer, "DNS resolver IP[:port] for HTTP downloads; an empty value uses the system resolver")
-	allow := fs.String("allow", "", "comma-separated commands to add to the allow-list (also the way to permit a sensitive command such as sudo or python3)")
-	disable := fs.String("disable", "", "comma-separated commands to disable outright")
-	strict := fs.Bool("strict", false, "block every command that is not allow-listed; by default an unlisted command runs and is flagged in the audit log, and only sensitive ones (sudo, shells, interpreters, host package managers, …) are blocked")
-	allowSudo := fs.Bool("allow-sudo", false, "answer sudo/doas credential probes (sudo -v, sudo -l CMD) with success so installers that gate on sudo proceed; sudo CMD still runs CMD confined, never escalated")
-	allowInRoot := fs.Bool("allow-in-root", false, "permit native executables installed inside the sandbox root; unsafe because native code runs outside in-process enforcement")
-	auditPath := fs.String("audit", "-", "write the audit log here (\"-\" = stderr, \"\" = off)")
-	data := fs.Int("data", 0, "bytes of stdin/stdout to capture per command in the audit log")
-	root := fs.String("root", "sandbox", "sandbox directory; it is emptied on every run, so it must be missing, empty, or carry smash's ownership marker")
-	if err := fs.Parse(argv); err != nil {
+	fl, err := parseFlags(argv)
+	if err != nil {
 		return err
 	}
-	if *initPolicy != "" {
-		return policy.WriteTemplate(*initPolicy)
+	if fl.initPolicy != "" {
+		return policy.WriteTemplate(fl.initPolicy)
 	}
-	if *profile && *manifestPath != "" {
+	if fl.profile && fl.manifestPath != "" {
 		return fmt.Errorf("-profile and -manifest cannot be used together")
 	}
-	if *profileOutput != "" && !*profile {
+	if fl.profileOutput != "" && !fl.profile {
 		return fmt.Errorf("-profile-output requires -profile")
 	}
-	set := map[string]bool{} // flags the user actually typed
-	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
 
 	pol := &policy.File{}
-	if *policyPath != "" {
-		p, err := policy.Load(*policyPath)
+	if fl.policyPath != "" {
+		p, err := policy.Load(fl.policyPath)
 		if err != nil {
 			return err
 		}
 		pol = p
 	}
-
-	// The script and its arguments: the command line wins as a unit, so
-	// `smash -policy p.yaml other.sh` does not silently inherit p.yaml's args.
-	scriptArg, scriptArgs := pol.Script, pol.Args
-	if fs.NArg() > 0 {
-		scriptArg, scriptArgs = fs.Arg(0), fs.Args()[1:]
+	scriptArg, scriptArgs, err := resolveScriptArg(pol, fl)
+	if err != nil {
+		return err
 	}
-	if scriptArg == "" {
-		return fmt.Errorf("usage: smash [flags] SCRIPT|URL [ARGS…]  (or -policy FILE with a script: key, or -init-policy FILE)")
-	}
-	effectiveDNS := sandbox.DefaultDNSServer
-	if !*profile && pol.Network != nil && pol.Network.DNSServer != nil {
-		effectiveDNS = *pol.Network.DNSServer
-	}
-	if !*profile && set["dns-server"] {
-		effectiveDNS = *dnsServer
-	}
-	scriptClient, err := sandbox.NewHTTPClient(60*time.Second, effectiveDNS)
+	scriptClient, err := sandbox.NewHTTPClient(60*time.Second, effectiveDNS(pol, fl))
 	if err != nil {
 		return err
 	}
@@ -131,33 +102,168 @@ func runCLI(argv []string) error {
 	if err != nil {
 		return err
 	}
-	if *profile && *profileOutput == "" {
-		*profileOutput = defaultManifestPath(name)
+	if fl.profile && fl.profileOutput == "" {
+		fl.profileOutput = defaultManifestPath(name)
 	}
 	var runManifest *profilemanifest.Manifest
-	if *manifestPath != "" {
-		runManifest, err = profilemanifest.Load(*manifestPath)
+	if fl.manifestPath != "" {
+		runManifest, err = profilemanifest.Load(fl.manifestPath)
 		if err != nil {
 			return err
 		}
 		if err := runManifest.Verify(script); err != nil {
-			return fmt.Errorf("%s: %w", *manifestPath, err)
+			return fmt.Errorf("%s: %w", fl.manifestPath, err)
 		}
 	}
 
-	rootPath := *root
-	if !set["root"] && pol.Root != nil {
+	rootPath := fl.root
+	if !fl.set["root"] && pol.Root != nil {
 		rootPath = *pol.Root
 	}
 	rootAbs, err := filepath.Abs(rootPath)
 	if err != nil {
 		return err
 	}
-	home := filepath.Join(rootAbs, "home")
-	tmp := filepath.Join(rootAbs, "tmp")
 	if err := resetRoot(rootAbs); err != nil {
 		return err
 	}
+	cfg, err := buildConfig(pol, fl, rootAbs, scriptArgs, runManifest)
+	if err != nil {
+		return err
+	}
+	view, cleanup, err := wireAudit(pol, fl, &cfg)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	var profiler *profilemanifest.Profiler
+	if fl.profile {
+		profiler = profilemanifest.NewProfiler(name, script, cfg.Auditor)
+		cfg.Auditor = profiler
+	}
+	var runErr error
+	if view != nil {
+		runErr = view.Run(func(ctx context.Context) error {
+			return sandbox.RunContext(ctx, cfg, name, script)
+		})
+	} else {
+		runErr = sandbox.Run(cfg, name, script)
+	}
+	if profiler == nil {
+		return runErr
+	}
+	writeErr := profiler.Manifest().Write(fl.profileOutput)
+	if writeErr == nil {
+		fmt.Fprintf(os.Stderr, "wrote profile manifest %s\n", fl.profileOutput)
+	} else {
+		writeErr = fmt.Errorf("writing profile manifest %s: %w", fl.profileOutput, writeErr)
+	}
+	return errors.Join(runErr, writeErr)
+}
+
+// cliFlags is the parsed command line. set records which flags the user
+// actually TYPED: the precedence between a policy file and the flags is keyed
+// off it, because a flag's zero value and an absent flag must not have the
+// same effect.
+type cliFlags struct {
+	policyPath    string
+	initPolicy    string
+	profile       bool
+	profileOutput string
+	manifestPath  string
+	urls          string
+	urlsGitHub    bool
+	gitHosts      string
+	dnsServer     string
+	allow         string
+	disable       string
+	strict        bool
+	allowSudo     bool
+	allowInRoot   bool
+	audit         string
+	data          int
+	root          string
+
+	scriptGiven bool     // a positional argument was present, even an empty one
+	script      string   // the first positional argument
+	args        []string // the positionals after it
+	set         map[string]bool
+}
+
+func parseFlags(argv []string) (*cliFlags, error) {
+	fl := &cliFlags{}
+	fs := flag.NewFlagSet("smash", flag.ContinueOnError)
+	fs.StringVar(&fl.policyPath, "policy", "", "read the run's policy from a YAML file; flags given here override it (see -init-policy)")
+	fs.StringVar(&fl.initPolicy, "init-policy", "", "write a commented boilerplate policy file here (\"-\" = stdout) and exit")
+	fs.BoolVar(&fl.profile, "profile", false, "run the script and write its SHA-256 plus observed commands and hosts to a manifest")
+	fs.StringVar(&fl.profileOutput, "profile-output", "", "profile manifest path (default: <script>.manifest.yaml)")
+	fs.StringVar(&fl.manifestPath, "manifest", "", "verify the script hash and restrict the run to commands and hosts in this manifest")
+	fs.StringVar(&fl.urls, "urls", "", "comma-separated URL prefixes to allow (replaces the default)")
+	fs.BoolVar(&fl.urlsGitHub, "urls-github", false, "also allow GitHub release downloads (github.com, api.github.com, raw/codeload/objects/release-assets hosts)")
+	fs.StringVar(&fl.gitHosts, "git-hosts", "", "comma-separated hosts git may reach (replaces the default github.com,gitlab.com,bitbucket.org)")
+	fs.StringVar(&fl.dnsServer, "dns-server", sandbox.DefaultDNSServer, "DNS resolver IP[:port] for HTTP downloads; an empty value uses the system resolver")
+	fs.StringVar(&fl.allow, "allow", "", "comma-separated commands to add to the allow-list (also the way to permit a sensitive command such as sudo or python3)")
+	fs.StringVar(&fl.disable, "disable", "", "comma-separated commands to disable outright")
+	fs.BoolVar(&fl.strict, "strict", false, "block every command that is not allow-listed; by default an unlisted command runs and is flagged in the audit log, and only sensitive ones (sudo, shells, interpreters, host package managers, …) are blocked")
+	fs.BoolVar(&fl.allowSudo, "allow-sudo", false, "answer sudo/doas credential probes (sudo -v, sudo -l CMD) with success so installers that gate on sudo proceed; sudo CMD still runs CMD confined, never escalated")
+	fs.BoolVar(&fl.allowInRoot, "allow-in-root", false, "permit native executables installed inside the sandbox root; unsafe because native code runs outside in-process enforcement")
+	fs.StringVar(&fl.audit, "audit", "-", "write the audit log here (\"-\" = stderr, \"\" = off)")
+	fs.IntVar(&fl.data, "data", 0, "bytes of stdin/stdout to capture per command in the audit log")
+	fs.StringVar(&fl.root, "root", "sandbox", "sandbox directory; it is emptied on every run, so it must be missing, empty, or carry smash's ownership marker")
+	if err := fs.Parse(argv); err != nil {
+		return nil, err
+	}
+	fl.set = map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { fl.set[f.Name] = true })
+	if fs.NArg() > 0 {
+		fl.scriptGiven = true
+		fl.script, fl.args = fs.Arg(0), fs.Args()[1:]
+	}
+	return fl, nil
+}
+
+// resolveScriptArg picks the script and its arguments. The command line wins
+// as a unit: `smash -policy p.yaml other.sh` replaces the policy's script AND
+// its args, so a new script does not silently inherit arguments meant for the
+// old one.
+func resolveScriptArg(pol *policy.File, fl *cliFlags) (script string, args []string, err error) {
+	script, args = pol.Script, pol.Args
+	if fl.scriptGiven {
+		script, args = fl.script, fl.args
+	}
+	if script == "" {
+		return "", nil, fmt.Errorf("usage: smash [flags] SCRIPT|URL [ARGS…]  (or -policy FILE with a script: key, or -init-policy FILE)")
+	}
+	return script, args, nil
+}
+
+// effectiveDNS is the one place the DNS-resolver precedence lives: a typed
+// -dns-server beats the policy file beats the default. Profile mode pins the
+// default — enforcement is off, and profiling must not fail because the policy
+// under construction names a broken resolver. The script fetch needs this
+// value before a Config exists; a non-profile run's Config ends up with the
+// same value through the ordinary policy-then-typed-flags layering in
+// buildConfig.
+func effectiveDNS(pol *policy.File, fl *cliFlags) string {
+	switch {
+	case fl.profile:
+		return sandbox.DefaultDNSServer
+	case fl.set["dns-server"]:
+		return fl.dnsServer
+	case pol.Network != nil && pol.Network.DNSServer != nil:
+		return *pol.Network.DNSServer
+	}
+	return sandbox.DefaultDNSServer
+}
+
+// buildConfig assembles the run's Config in precedence order: sandbox
+// defaults, then the policy file (pol.Apply), then each flag the user
+// actually typed, then the manifest's command and host authority, and
+// validation last. rootAbs has already been reset by resetRoot.
+func buildConfig(pol *policy.File, fl *cliFlags, rootAbs string, scriptArgs []string, runManifest *profilemanifest.Manifest) (sandbox.Config, error) {
+	home := filepath.Join(rootAbs, "home")
+	tmp := filepath.Join(rootAbs, "tmp")
 	// Scripts probe TERM for colour and screen control (`clear` exits 1 on a
 	// dumb terminal, fatal under set -e), so pass the caller's through.
 	term := os.Getenv("TERM")
@@ -176,108 +282,94 @@ func runCLI(argv []string) error {
 	cfg.Stdin = os.Stdin
 	cfg.Args = scriptArgs
 	if err := pol.Apply(&cfg); err != nil {
-		return err
+		return sandbox.Config{}, err
 	}
 
 	// Flag overrides. Each is applied only if the user typed it, so a policy
 	// file's value survives an untouched flag's zero default.
+	set := fl.set
 	if set["urls"] {
-		cfg.Network.AllowedPrefixes = splitList(*urls)
+		cfg.Network.AllowedPrefixes = splitList(fl.urls)
 	}
-	if set["urls-github"] && *urlsGitHub {
+	if set["urls-github"] && fl.urlsGitHub {
 		cfg.Network.AllowedPrefixes = append(cfg.Network.AllowedPrefixes, sandbox.GitHubPrefixes()...)
 	}
 	if set["git-hosts"] {
-		cfg.Network.GitHosts = splitList(*gitHosts)
+		cfg.Network.GitHosts = splitList(fl.gitHosts)
 	}
 	if set["dns-server"] {
-		cfg.Network.DNSServer = *dnsServer
+		cfg.Network.DNSServer = fl.dnsServer
 	}
 	if set["allow"] {
-		cfg.Allowed = cfg.Allowed.With(splitList(*allow)...)
+		cfg.Allowed = cfg.Allowed.With(splitList(fl.allow)...)
 	}
 	if set["disable"] {
-		cfg.Disable(splitList(*disable)...)
+		cfg.Disable(splitList(fl.disable)...)
 	}
 	if set["strict"] {
-		cfg.Strict = *strict
+		cfg.Strict = fl.strict
 	}
 	if set["allow-sudo"] {
-		cfg.AllowSudo = *allowSudo
+		cfg.AllowSudo = fl.allowSudo
 	}
 	if set["allow-in-root"] {
-		cfg.AllowInRootExecutables = *allowInRoot
+		cfg.AllowInRootExecutables = fl.allowInRoot
 	}
-	if *profile {
+	if fl.profile {
 		cfg.Profile = true
 	}
 	if runManifest != nil {
 		runManifest.Apply(&cfg)
 	}
-	if !*profile {
+	if !fl.profile {
 		if err := cfg.Network.Validate(); err != nil {
-			return err
+			return sandbox.Config{}, err
 		}
 	}
+	return cfg, nil
+}
 
-	audit, dataBytes := *auditPath, *data
+// wireAudit resolves where the audit stream goes — a typed -audit/-data flag
+// beats the policy's audit: section — and installs the sink on cfg: "" is
+// off, "-" is the split view when the terminal supports it (plain stderr when
+// it does not), anything else a file. It returns the view when one was
+// started, so the caller runs the script through it, and a cleanup to defer.
+func wireAudit(pol *policy.File, fl *cliFlags, cfg *sandbox.Config) (*splitview.View, func(), error) {
+	audit, dataBytes := fl.audit, fl.data
 	if a := pol.Audit; a != nil {
-		if !set["audit"] && a.Path != nil {
+		if !fl.set["audit"] && a.Path != nil {
 			audit = *a.Path
 		}
-		if !set["data"] && a.Data != nil {
+		if !fl.set["data"] && a.Data != nil {
 			dataBytes = *a.Data
 		}
 	}
-	var view *splitview.View
+	cfg.AuditData = dataBytes
+	cleanup := func() {}
 	switch audit {
 	case "":
 	case "-":
-		var ok bool
-		view, ok, err = splitview.Start(os.Stdin, os.Stdout, os.Stderr)
+		view, ok, err := splitview.Start(os.Stdin, os.Stdout, os.Stderr)
 		if err != nil {
-			return err
+			return nil, cleanup, err
 		}
-		if ok {
-			defer view.Close()
-			cfg.Stdin, cfg.Stdout, cfg.Stderr = view.Stdio()
-			cfg.ControllingTTY = view.TTY()
-			cfg.Auditor = sandbox.TextAuditor(view.EventWriter(), sandbox.ShortPaths(cfg))
-		} else {
-			cfg.Auditor = sandbox.TextAuditor(os.Stderr, sandbox.ShortPaths(cfg))
+		if !ok {
+			cfg.Auditor = sandbox.TextAuditor(os.Stderr, sandbox.ShortPaths(*cfg))
+			break
 		}
+		cfg.Stdin, cfg.Stdout, cfg.Stderr = view.Stdio()
+		cfg.ControllingTTY = view.TTY()
+		cfg.Auditor = sandbox.TextAuditor(view.EventWriter(), sandbox.ShortPaths(*cfg))
+		return view, func() { view.Close() }, nil
 	default:
 		f, err := os.Create(audit)
 		if err != nil {
-			return err
+			return nil, cleanup, err
 		}
-		defer f.Close()
-		cfg.Auditor = sandbox.TextAuditor(f, sandbox.ShortPaths(cfg))
+		cfg.Auditor = sandbox.TextAuditor(f, sandbox.ShortPaths(*cfg))
+		cleanup = func() { f.Close() }
 	}
-	cfg.AuditData = dataBytes
-	var profiler *profilemanifest.Profiler
-	if *profile {
-		profiler = profilemanifest.NewProfiler(name, script, cfg.Auditor)
-		cfg.Auditor = profiler
-	}
-	var runErr error
-	if view != nil {
-		runErr = view.Run(func(ctx context.Context) error {
-			return sandbox.RunContext(ctx, cfg, name, script)
-		})
-	} else {
-		runErr = sandbox.Run(cfg, name, script)
-	}
-	if profiler == nil {
-		return runErr
-	}
-	writeErr := profiler.Manifest().Write(*profileOutput)
-	if writeErr == nil {
-		fmt.Fprintf(os.Stderr, "wrote profile manifest %s\n", *profileOutput)
-	} else {
-		writeErr = fmt.Errorf("writing profile manifest %s: %w", *profileOutput, writeErr)
-	}
-	return errors.Join(runErr, writeErr)
+	return nil, cleanup, nil
 }
 
 func defaultManifestPath(scriptName string) string {

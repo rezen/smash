@@ -415,29 +415,74 @@ func yamlScalar(s string) string {
 	return s
 }
 
+// plainWouldMisread reports whether a plain (unquoted) scalar carrying s
+// would be read back as anything other than this exact string. Each predicate
+// names one way that can happen; double-quoting is the answer to all of them.
 func plainWouldMisread(s string) bool {
-	if !utf8.ValidString(s) || strings.TrimSpace(s) != s {
-		return true
-	}
-	if strings.ContainsAny(s[:1], "-?:,[]{}#&*!|>'\"%@`") {
-		return true // indicators cannot start a plain scalar
-	}
-	if strings.ContainsAny(s, ",[]{}") || strings.Contains(s, ": ") || strings.Contains(s, " #") || strings.HasSuffix(s, ":") {
-		return true // flow indicators, or what would read as a mapping or comment
-	}
+	return !utf8.ValidString(s) || // strconv.Quote escapes what plain can't carry
+		trimsDifferently(s) ||
+		startsWithIndicator(s) ||
+		containsFlowIndicator(s) ||
+		readsAsMappingOrComment(s) ||
+		containsNonPrintable(s) ||
+		readsAsNullBoolOrFloat(s) ||
+		readsAsNumber(s)
+}
+
+// trimsDifferently: a plain scalar sheds leading and trailing whitespace, so
+// a value with either would come back shortened.
+func trimsDifferently(s string) bool { return strings.TrimSpace(s) != s }
+
+// startsWithIndicator: indicator characters cannot begin a plain scalar —
+// "- x" is a sequence item, "&x" an anchor, "!x" a tag, and so on.
+func startsWithIndicator(s string) bool {
+	return s != "" && strings.ContainsAny(s[:1], "-?:,[]{}#&*!|>'\"%@`")
+}
+
+// containsFlowIndicator: the scalar must survive flow context ("[a, b]"),
+// where , [ ] { } end a plain scalar wherever they appear — and go-yaml ends
+// one at "?" too, so an unquoted URL with a query string would corrupt a
+// resources: [...] list (found by TestTextAuditorEmitsValidYAML).
+func containsFlowIndicator(s string) bool { return strings.ContainsAny(s, ",[]{}?") }
+
+// readsAsMappingOrComment: ": " (or a trailing ":") would turn the value into
+// a mapping, and " #" starts a comment mid-scalar.
+func readsAsMappingOrComment(s string) bool {
+	return strings.Contains(s, ": ") || strings.Contains(s, " #") || strings.HasSuffix(s, ":")
+}
+
+// containsNonPrintable: control characters and other unprintables only
+// survive inside a double-quoted scalar's escapes.
+func containsNonPrintable(s string) bool {
 	for _, r := range s {
 		if !unicode.IsPrint(r) {
 			return true
 		}
 	}
+	return false
+}
+
+// readsAsNullBoolOrFloat: the words YAML resolves to null, a boolean or a
+// special float, in any case ("Yes", "NULL", "-.Inf").
+func readsAsNullBoolOrFloat(s string) bool {
 	switch strings.ToLower(s) {
 	case "~", "null", "true", "false", "yes", "no", "on", "off", "y", "n", ".inf", "-.inf", "+.inf", ".nan":
-		return true // would become null or a bool or float
-	}
-	if c := s[0]; '0' <= c && c <= '9' || len(s) > 1 && strings.ContainsRune("+-.", rune(c)) && '0' <= s[1] && s[1] <= '9' {
-		return true // could read as a number (600, 1e3, 0x1f, 1:30)
+		return true
 	}
 	return false
+}
+
+// readsAsNumber: anything that could resolve numerically (600, 1e3, 0x1f,
+// 1:30, -1, .5). Over-broad on purpose: a quoted number is still the same
+// string, while a misread one is not.
+func readsAsNumber(s string) bool {
+	if s == "" {
+		return false
+	}
+	if c := s[0]; '0' <= c && c <= '9' {
+		return true
+	}
+	return len(s) > 1 && strings.ContainsRune("+-.", rune(s[0])) && '0' <= s[1] && s[1] <= '9'
 }
 
 func durationString(d time.Duration) string {

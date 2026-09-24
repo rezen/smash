@@ -25,6 +25,8 @@ import (
 	"mvdan.cc/sh/v3/interp"
 
 	"github.com/rezen/smash/internal/command"
+	"github.com/rezen/smash/internal/hostname"
+	"github.com/rezen/smash/internal/pathsafe"
 	"github.com/rezen/smash/internal/tool"
 )
 
@@ -107,19 +109,9 @@ func DefaultPolicy() Policy {
 }
 
 // Allows reports whether u may be fetched: some AllowedPrefixes entry matches
-// it, and the URL is unambiguous about where it goes.
-//
-// Two shapes are refused before the list is consulted, because both are ways
-// to write a URL that READS as one host and RESOLVES as another — the failure
-// mode of every allow-list that compares URLs as text:
-//
-//   - userinfo. "https://allowed.example@evil.example/x" has the allow-listed
-//     name in it, and an HTTP client dials evil.example.
-//   - a "." or ".." path segment, in raw or percent-encoded form.
-//     "https://host/allowed/../evil" passes any path check and is normalised
-//     by the server afterwards.
+// it, and the URL is unambiguous about where it goes (see disguisesItsHost).
 func (p Policy) Allows(u *url.URL) bool {
-	if u == nil || u.User != nil || hasDotSegment(u.Path) {
+	if u == nil || disguisesItsHost(u) {
 		return false
 	}
 	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
@@ -137,39 +129,21 @@ func (p Policy) Allows(u *url.URL) bool {
 }
 
 // AllowsTarget permits allow-listed URLs and raw endpoints whose host appears
-// in AllowedHosts.
+// in AllowedHosts. The host is extracted by hostname.FromEndpoint — the same
+// rules the manifest Profiler records hosts with, so a profiled manifest
+// matches at enforcement time by construction.
 func (p Policy) AllowsTarget(target string) bool {
 	if strings.Contains(target, "://") {
 		u, err := url.Parse(target)
 		return err == nil && p.Allows(u)
 	}
-	host := endpointHost(target)
+	host := hostname.FromEndpoint(target)
 	for _, allowed := range p.AllowedHosts {
 		if host == strings.ToLower(strings.TrimSuffix(allowed, ".")) {
 			return true
 		}
 	}
 	return false
-}
-
-func endpointHost(target string) string {
-	rest := target
-	if i := strings.IndexByte(rest, '@'); i >= 0 {
-		rest = rest[i+1:]
-	}
-	if h := strings.Trim(rest, "[]"); net.ParseIP(h) != nil {
-		return strings.ToLower(h)
-	}
-	if h, _, err := net.SplitHostPort(rest); err == nil {
-		return strings.ToLower(strings.TrimSuffix(h, "."))
-	}
-	if h, _, ok := strings.Cut(rest, ":"); ok {
-		rest = h
-	}
-	if strings.ContainsAny(rest, "/ ") {
-		return ""
-	}
-	return strings.ToLower(strings.TrimSuffix(strings.Trim(rest, "[]"), "."))
 }
 
 // Validate reports malformed URL prefixes and DNS resolver endpoints. A
@@ -186,7 +160,7 @@ func (p Policy) Validate() error {
 		return fmt.Errorf("URL allow-list needs a scheme on every entry (e.g. https://host/path); cannot use %s", strings.Join(bad, ", "))
 	}
 	for _, host := range p.AllowedHosts {
-		if host == "" || strings.ContainsAny(host, "/@ \\") || strings.Contains(host, ":") && net.ParseIP(host) == nil {
+		if !hostname.Valid(host) {
 			return fmt.Errorf("invalid allowed host %q", host)
 		}
 	}
@@ -243,6 +217,19 @@ func canonicalHost(u *url.URL) string {
 
 var defaultPorts = map[string]string{"http": "80", "https": "443"}
 
+// disguisesItsHost refuses the two URL shapes that READ as one host and
+// RESOLVE as another — the failure mode of every allow-list that compares
+// URLs as text:
+//
+//   - userinfo. "https://allowed.example@evil.example/x" has the allow-listed
+//     name in it, and an HTTP client dials evil.example.
+//   - a "." or ".." path segment, in raw or percent-encoded form.
+//     "https://host/allowed/../evil" passes any path check and is normalised
+//     by the server afterwards.
+func disguisesItsHost(u *url.URL) bool {
+	return u.User != nil || hasDotSegment(u.Path)
+}
+
 // hasDotSegment reports whether a path has a "." or ".." segment. url.Parse
 // has already decoded percent-escapes into Path, so %2e%2e is caught here too.
 func hasDotSegment(p string) bool {
@@ -271,7 +258,7 @@ func (p Policy) AllowsGit(target string) bool {
 	if u, err := url.Parse(target); err == nil && strings.EqualFold(u.Scheme, "file") {
 		return true
 	}
-	host := gitTargetHost(target)
+	host := hostname.FromGitRemote(target)
 	if host == "" {
 		return false
 	}
@@ -281,27 +268,6 @@ func (p Policy) AllowsGit(target string) bool {
 		}
 	}
 	return false
-}
-
-// gitTargetHost extracts the host from a git remote: scheme://[user@]host[:port]/path
-// or the scp-like [user@]host:path. "" when the target isn't a remote.
-func gitTargetHost(target string) string {
-	if strings.Contains(target, "://") {
-		u, err := url.Parse(target)
-		if err != nil {
-			return ""
-		}
-		return strings.ToLower(u.Hostname())
-	}
-	rest := target
-	if i := strings.IndexByte(rest, '@'); i >= 0 {
-		rest = rest[i+1:]
-	}
-	host, _, ok := strings.Cut(rest, ":")
-	if !ok || host == "" || strings.ContainsAny(host, "/ ") {
-		return ""
-	}
-	return strings.ToLower(host)
 }
 
 // client builds the http.Client with the policy applied. Everything you'd
@@ -333,7 +299,7 @@ func httpMiddleware(p Policy, root string) (Middleware, error) {
 	return tool.Downloaders(tool.DownloaderConfig{
 		Client:         client,
 		AllowURL:       p.Allows,
-		AllowPath:      func(target string) bool { return root == "" || withinRoot(root, target) },
+		AllowPath:      func(target string) bool { return root == "" || pathsafe.Within(root, target) },
 		AllowedMethods: p.AllowedMethods,
 		MaxResponse:    p.MaxResponse,
 		MaxRequest:     p.MaxRequest,
@@ -341,29 +307,37 @@ func httpMiddleware(p Policy, root string) (Middleware, error) {
 	}), nil
 }
 
-// egressGuardMiddleware denies any network-capable command whose target isn't
-// allow-listed — openssl s_client, ssh, nc, git clone — from ONE place, using
-// the parser's Egress indicator. git is judged by host (Policy.GitHosts),
-// everything else by the URL prefix list. Downloaders are served upstream by
+// egressGuardMiddleware denies any network-capable command whose egress is
+// off-policy — openssl s_client, ssh, nc, git clone — from ONE place, using
+// the parser's classified Egress (command.EgressInfo). A URL target is
+// matched against the prefix allow-list, an endpoint against AllowedHosts,
+// and an INDICATOR — a target that names the operation rather than a place
+// (`apt-get install`, `gpg --recv-keys`, a perl/python network module) — is
+// off-policy by definition: no allow-list entry can name one. git is judged
+// by host instead (Policy.GitHosts), resolving an indicator (a remote name)
+// through the repository's config first. Downloaders are served upstream by
 // httpMiddleware, so they don't reach here.
 func egressGuardMiddleware(p Policy) Middleware {
 	return func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 		return func(ctx context.Context, args []string) error {
 			parsed := command.Parse(args)
-			target, networked := parsed.Egress()
+			egress, networked := parsed.EgressInfo()
 			if !networked {
 				return next(ctx, args)
 			}
 			hc := interp.HandlerCtx(ctx)
-			allowed := p.AllowsTarget(target)
+			target := egress.Target
+			var allowed bool
 			if _, isGit := parsed.Command().(command.Git); isGit {
 				allowed = p.AllowsGit(target)
-				if !allowed && gitTargetHost(target) == "" { // a remote name: resolve it
+				if !allowed && egress.Kind == command.EgressIndicator { // a remote name: resolve it
 					if url := resolveGitRemote(hc.Dir, hc.Env, parsed); url != "" {
 						target = target + " = " + url
 						allowed = p.AllowsGit(url)
 					}
 				}
+			} else if egress.Kind != command.EgressIndicator {
+				allowed = p.AllowsTarget(target) // an indicator stays denied: it names no place
 			}
 			if !allowed {
 				return failf(hc.Stderr, 1, "[sandbox] network egress denied: %s → %s", parsed.Name, target)

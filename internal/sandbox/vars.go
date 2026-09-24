@@ -38,13 +38,7 @@ func (v Vars) Names() []string {
 // returned even when the script fails, so a post-run audit can see how far it
 // got and with which values.
 func RunVars(cfg Config, name, src string) (Vars, error) {
-	cfg = cfg.normalized()
-	cfg.Posix = cfg.Posix || shebangIsSh(src)
-	prog, err := parseBash(name, src)
-	if err != nil {
-		return nil, err
-	}
-	runner, err := buildRunner(cfg)
+	cfg, runner, prog, err := prepareRun(cfg, name, src)
 	if err != nil {
 		return nil, err
 	}

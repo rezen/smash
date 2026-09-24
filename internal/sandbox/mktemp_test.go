@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"mvdan.cc/sh/v3/expand"
+
+	"github.com/rezen/smash/internal/pathsafe"
 )
 
 func TestMktempRunsInProcessAndUsesTMPDIR(t *testing.T) {
@@ -43,11 +45,11 @@ func TestMktempRunsInProcessAndUsesTMPDIR(t *testing.T) {
 		t.Fatalf("paths = %q", out.String())
 	}
 	for i, name := range paths[:3] {
-		if !pathWithin(tmp, name) {
+		if !pathsafe.LexicallyWithin(tmp, name) {
 			t.Errorf("path %d = %q, want it under TMPDIR %q", i, name, tmp)
 		}
 	}
-	if !pathWithin(explicit, paths[3]) {
+	if !pathsafe.LexicallyWithin(explicit, paths[3]) {
 		t.Errorf("explicit template created %q, want it under %q", paths[3], explicit)
 	}
 	for i, name := range paths {

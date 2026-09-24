@@ -12,7 +12,7 @@
 //	control.go    Disable (deny-list) and Mock (matchers → canned responses)
 //	audit.go      AuditRecord, Auditor, stdin/stdout capture; OpenRecord for redirections
 //	allowlist.go  the command gate: allow-list, sensitive list, unlisted-runs-audited (+ the in-sandbox escape hatch)
-//	middleware.go sudo/env/timeout/… unwrapping + the sleep cap
+//	middleware.go sudo/env/timeout/… unwrapping, the sudo-probe grant, the safe `git --version` probe, and the sleep cap
 //	shinterp.go   `sh -c 'SCRIPT'` parsed & re-run confined
 //	internal/tool provides the portable in-process command implementations
 //	network.go    Policy; curl/wget served via net/http; the egress guard
@@ -31,7 +31,6 @@ import (
 	"io"
 	"maps"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -41,6 +40,7 @@ import (
 	"mvdan.cc/sh/v3/syntax"
 
 	"github.com/rezen/smash/internal/command"
+	"github.com/rezen/smash/internal/shebang"
 	"github.com/rezen/smash/internal/tool"
 )
 
@@ -106,7 +106,10 @@ type Config struct {
 	// shebang-less script that would be piped to sh.
 	Posix bool
 
-	depth int // `sh -c` nesting depth
+	// depth is the `sh -c`/in-root script nesting depth. It rides Config —
+	// rather than a parameter — because each confined sub-runner is built
+	// from a wholesale copy of the parent's Config (see shinterp.go).
+	depth int
 }
 
 // NewConfig returns a Config with the default network policy, allow-list and
@@ -150,19 +153,31 @@ func Run(cfg Config, name, src string) error {
 // RunContext is Run with cancellation controlled by the caller. Config.Timeout
 // remains an upper bound and is layered over ctx.
 func RunContext(ctx context.Context, cfg Config, name, src string) error {
-	cfg = cfg.normalized()
-	cfg.Posix = cfg.Posix || shebangIsSh(src)
-	prog, err := parseBash(name, src)
-	if err != nil {
-		return err
-	}
-	runner, err := buildRunner(cfg)
+	cfg, runner, prog, err := prepareRun(cfg, name, src)
 	if err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(ctx, cfg.Timeout)
 	defer cancel()
 	return runner.Run(ctx, prog)
+}
+
+// prepareRun is the shared front half of RunContext and RunVars: normalize
+// cfg, apply the shebang POSIX rule, parse src, and assemble the runner. The
+// returned Config carries the normalized Timeout the caller bounds the run
+// with.
+func prepareRun(cfg Config, name, src string) (Config, *interp.Runner, *syntax.File, error) {
+	cfg = cfg.normalized()
+	cfg.Posix = cfg.Posix || shebang.IsSh(src)
+	prog, err := parseBash(name, src)
+	if err != nil {
+		return cfg, nil, nil, err
+	}
+	runner, err := buildRunner(cfg)
+	if err != nil {
+		return cfg, nil, nil, err
+	}
+	return cfg, runner, prog, nil
 }
 
 // parseBash parses a script with the bash dialect and applies the
@@ -181,20 +196,6 @@ func parseBash(name, src string) (*syntax.File, error) {
 // "${BASH_VERSION}" ] && exit 1`) or to enforce a minimum (rvm sorts it
 // against BASH_MIN_VERSION), so it must look like a real, current release.
 const bashVersion = "5.2.37(1)-release"
-
-// shebangIsSh reports whether src's first line is a shebang for sh itself
-// (`#!/bin/sh`, `#!/usr/bin/env sh`, …) as opposed to bash or no shebang.
-func shebangIsSh(src string) bool {
-	line, _, _ := strings.Cut(src, "\n")
-	if !strings.HasPrefix(line, "#!") {
-		return false
-	}
-	fields := strings.Fields(line[2:])
-	if len(fields) > 0 && filepath.Base(fields[0]) == "env" {
-		fields = fields[1:]
-	}
-	return len(fields) > 0 && filepath.Base(fields[0]) == "sh"
-}
 
 // bashEnviron layers the variables bash itself defines over the caller's
 // environment. Like bash, it does not export them, so exec'd commands do not
@@ -281,65 +282,98 @@ func (e bashEnviron) Each(fn func(name string, vr expand.Variable) bool) {
 	}
 }
 
-// buildRunner assembles the interp.Runner. Exec middlewares compose outer→inner:
-// unwrap wrappers → [audit] → [deny] → [sudo grant] → [mock] → safe git version probe → cap sleeps → confine `sh -c` and in-root shell
-// scripts → [emulated uname] → serve
-// curl/wget → egress guard → command gate (allow-list / sensitive / in-root / unlisted). The CallHandler shims a couple of
-// builtins; the Open/Stat/Access handlers cover emulated files, /dev/tcp and
-// [the audit of] the shell's own opens (redirections, `source`).
-func buildRunner(cfg Config) (*interp.Runner, error) {
+// execStack is the ordered exec middleware stack: the layer names (stable,
+// asserted by TestExecLayerOrdering) parallel to the middlewares themselves.
+type execStack struct {
+	names []string
+	mws   []Middleware
+}
+
+func (s *execStack) add(name string, mw Middleware) {
+	s.names = append(s.names, name)
+	s.mws = append(s.mws, mw)
+}
+
+// execLayers assembles the exec middleware stack, outermost first. The order
+// is the enforcement contract:
+//
+//	unwrap       strip sudo/env/timeout/… so every later layer sees the real command
+//	audit        record the real command and its true outcome, whichever layer ends it
+//	deny         disabled commands die first: they cannot be mocked back to life,
+//	             and -disable sudo beats AllowSudo's grant
+//	sudo-grant   answer sudo/doas credential probes with success (AllowSudo, profile)
+//	mock         canned responses, before the network layer and the gate
+//	git-version  the inert `git --version` probe; real git stays sensitive
+//	sleep-cap    cap sleeps so no script burns real wall-time
+//	sh-interp    `sh -c` parsed and re-run confined, so nested commands stay visible
+//	tool-*       in-process mktemp/sha256sum/base64 (portable, honoring TMPDIR)
+//	uname        emulated target OS (Emulation)
+//	http         curl/wget served by net/http under the URL policy, writing inside root
+//	egress       every other network-capable command judged by its parsed intent
+//	gate         allow-list / sensitive / in-root / unlisted — the last word
+//	tty          hand interactive, terminal-facing commands the script PTY
+//
+// Profile mode observes without enforcing: only unwrap, audit, sudo-grant,
+// sh-interp, the tools, uname and tty are installed. TestProfileModeLayers
+// pins that carve-out; TestExecLayerOrdering pins the order above.
+func execLayers(cfg Config) (*execStack, error) {
+	enforcing := !cfg.Profile
 	e := cfg.Emulation
-	mws := []Middleware{unwrapMiddleware} // strip sudo/env/timeout/… wrappers first
+	s := &execStack{}
+	s.add("unwrap", unwrapMiddleware)
 	if cfg.Auditor != nil {
-		mws = append(mws, auditMiddleware(cfg.Auditor, cfg.AuditData)) // record the real command
+		s.add("audit", auditMiddleware(cfg.Auditor, cfg.AuditData))
 	}
-	if !cfg.Profile && len(cfg.Denied) > 0 {
-		mws = append(mws, denyMiddleware(cfg.Denied)) // disabled commands never run
+	if enforcing && len(cfg.Denied) > 0 {
+		s.add("deny", denyMiddleware(cfg.Denied))
 	}
 	if cfg.AllowSudo || cfg.Profile {
-		mws = append(mws, sudoGrantMiddleware) // sudo probes succeed (after deny: -disable sudo wins)
+		s.add("sudo-grant", sudoGrantMiddleware)
 	}
-	if !cfg.Profile && len(cfg.Mocks) > 0 {
-		mws = append(mws, mockMiddleware(cfg.Mocks)) // canned stdout/stderr/exit by matcher
+	if enforcing && len(cfg.Mocks) > 0 {
+		s.add("mock", mockMiddleware(cfg.Mocks))
 	}
-	if !cfg.Profile {
-		mws = append(mws,
-			gitVersionMiddleware(resolveHostCommandPath(cfg, "git")), // safe presence probe; real git remains sensitive
-			sleepCapMiddleware(time.Second/5),                        // no script burns real wall-time
-		)
+	if enforcing {
+		s.add("git-version", gitVersionMiddleware(resolveHostCommandPath(cfg, "git")))
+		s.add("sleep-cap", sleepCapMiddleware(time.Second/5))
 	}
-	mws = append(mws,
-		shInterpMiddleware(cfg), // parse `sh -c` so nested commands remain visible
-		tool.Mktemp,             // create temporary paths in-process, honoring the runner's TMPDIR
-		tool.SHA256Sum,          // portable hashing/checking, even when the host has no sha256sum
-		tool.Base64,             // portable encoding/decoding with GNU and BSD decode flags
-	)
+	s.add("sh-interp", shInterpMiddleware(cfg))
+	s.add("tool-mktemp", tool.Mktemp)
+	s.add("tool-sha256sum", tool.SHA256Sum)
+	s.add("tool-base64", tool.Base64)
 	if e.UnameOS != "" {
-		mws = append(mws, unameMiddleware(e))
+		s.add("uname", unameMiddleware(e))
 	}
-	if !cfg.Profile {
+	if enforcing {
 		httpMW, err := httpMiddleware(cfg.Network, cfg.Root)
 		if err != nil {
 			return nil, err
 		}
-		mws = append(mws,
-			httpMW,                             // curl/wget → net/http (allow-list), writing inside the root
-			egressGuardMiddleware(cfg.Network), // openssl/ssh/nc/git egress (parser-driven)
-		)
-	}
-	if !cfg.Profile {
-		mws = append(mws,
-			allowListMiddleware(gate{ // the command gate
-				root: cfg.Root, allowed: cfg.Allowed, sensitive: cfg.Sensitive,
-				denied: cfg.Denied, strict: cfg.Strict,
-				allowInRootExecutables: cfg.AllowInRootExecutables,
-				allowedPaths:           resolveAllowedPaths(cfg),
-				interpret:              confinedScriptRunner(cfg),
-			}),
-		)
+		s.add("http", httpMW)
+		s.add("egress", egressGuardMiddleware(cfg.Network))
+		s.add("gate", allowListMiddleware(gate{
+			root: cfg.Root, allowed: cfg.Allowed, sensitive: cfg.Sensitive,
+			denied: cfg.Denied, strict: cfg.Strict,
+			allowInRootExecutables: cfg.AllowInRootExecutables,
+			allowedPaths:           resolveAllowedPaths(cfg),
+			interpret:              confinedScriptRunner(cfg),
+		}))
 	}
 	if cfg.ControllingTTY != nil {
-		mws = append(mws, controllingTTYMiddleware(cfg.ControllingTTY))
+		s.add("tty", controllingTTYMiddleware(cfg.ControllingTTY))
+	}
+	return s, nil
+}
+
+// buildRunner assembles the interp.Runner: the exec stack (see execLayers for
+// the layer-by-layer contract), the CallHandler shims for a couple of
+// builtins, and the Open/Stat/Access handlers covering emulated files,
+// /dev/tcp and the audit of the shell's own opens (redirections, `source`).
+func buildRunner(cfg Config) (*interp.Runner, error) {
+	e := cfg.Emulation
+	stack, err := execLayers(cfg)
+	if err != nil {
+		return nil, err
 	}
 	var opens []OpenMiddleware
 	if !cfg.Profile {
@@ -358,7 +392,7 @@ func buildRunner(cfg Config) (*interp.Runner, error) {
 		interp.Dir(cfg.Dir),
 		interp.IgnoreErrexit(cfg.Profile),
 		interp.StdIO(cfg.Stdin, cfg.Stdout, cfg.Stderr),
-		interp.ExecHandlers(mws...),
+		interp.ExecHandlers(stack.mws...),
 		interp.CallHandler(detectionCallHandler),
 		interp.OpenHandler(open),
 		interp.StatHandler(virtualStatHandler(e)),
