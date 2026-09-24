@@ -19,6 +19,9 @@ A fresh clone will not build until this has run once. The upstream licence
 `handlerctx.patch` is a one-hunk diff against `interp/handler.go`; see Patch 7.
 `tty.patch` lets Smash mark a PTY as an external command's controlling terminal;
 see Patch 8.
+`zz-trap.patch` teaches the `trap` builtin the signal specs bash accepts; see
+Patch 9. It sorts last so that it applies to a tree the other patches have
+already changed, as `zz-profile.patch` does.
 `smash.patch` is a single unified diff against `interp/api.go`,
 `interp/runner.go`, `interp/test.go` and `expand/param.go` (the logical changes below share
 hunks, so they are not split). Every hunk is marked `smash patch` in the
@@ -177,6 +180,43 @@ now fails to compile rather than silently losing every captured byte if a
 resync drops the patch. This one is a candidate to upstream: it is additive and
 useful to anyone wrapping a handler.
 
+## Patch 9: `trap` and real signal specs
+
+Upstream `trap` (`interp/builtin.go`) understood only `ERR` and `EXIT`, and
+failed with status 2 and `trap: INT: invalid signal specification` for every
+other spec. Under `set -e` that aborts the script, so mole's
+
+    trap 'cleanup_installer' EXIT
+    trap 'cleanup_installer; exit 130' INT TERM
+
+died on the second line — and the same two-line cleanup idiom appears in
+pihole (`trap abort INT QUIT TERM`) and others.
+
+- `trapSignal` (`interp/builtin.go`) canonicalises a spec to the bare
+  upper-case name bash lists it under: a name with or without the `SIG`
+  prefix, in any case, a signal number, and the pseudo-signals `EXIT` (`0`)
+  and `ERR`. A spec bash rejects is still rejected with the upstream message.
+- `Runner.callbackSig` (`interp/api.go`) holds the callbacks registered for
+  real signals, keyed by that name. `trap - INT` deletes an entry and
+  `trap '' INT` records an empty one, which bash distinguishes; a bare `trap`
+  lists them after `EXIT` and `ERR`, under their `SIG` names, as bash does.
+
+The callbacks are recorded, never delivered. The interpreter runs the script
+in-process and no signal reaches it, so a handler for one cannot fire; the
+point of the patch is that registering it is not an error, and that an audit
+can see what the script asked to do on the way out. Its `EXIT` trap, which
+smash does run, is unaffected.
+
+Not covered: signal *numbers* are recognised only for the signals POSIX fixes
+to the same value on every platform (0-6, 8, 9, 11, 13-15). The ones that
+differ between Linux and Darwin — `USR1`, `USR2`, `BUS`, `SYS` — are accepted
+by name only, which is how scripts write them. An invalid spec also keeps
+upstream's exit status 2 where bash returns 1; either way `set -e` ends the
+script.
+
+`TestTrapSignalSpecs` and `TestTrapListsSignalTraps` in `internal/sandbox` pin
+it; every expectation was checked against `/bin/bash`.
+
 ## Refreshing
 
 To move to a newer upstream: bump the `mvdan.cc/sh/v3` version in the root
@@ -186,6 +226,7 @@ no longer applies (edit the generated files, then regenerate the patch with
 `--label a/PATH --label b/PATH` so it stays `patch -p1` compatible). Then
 `go test ./...` — `TestExtraFileDescriptors`, `TestNoclobber`,
 `TestErrexitCompoundBodies`, `TestNounsetUnusedWord`,
-`TestTestClauseShortCircuit`, `TestIndirectExpansion` and
-`TestWithHandlerContext` in `internal/sandbox` pin the behaviour. Better still, upstream the change:
+`TestTestClauseShortCircuit`, `TestIndirectExpansion`,
+`TestWithHandlerContext` and `TestTrapSignalSpecs` in `internal/sandbox` pin
+the behaviour. Better still, upstream the change:
 mvdan/sh tracks this gap as "support file descriptors other than 0, 1, 2".

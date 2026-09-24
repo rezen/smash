@@ -32,6 +32,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -201,7 +202,8 @@ func shebangIsSh(src string) bool {
 // sets one of these in Config.Env wins.
 type bashEnviron struct {
 	expand.Environ
-	posix bool // also advertise POSIXLY_CORRECT, as bash does when run as sh
+	posix  bool   // also advertise POSIXLY_CORRECT, as bash does when run as sh
+	ostype string // OSTYPE for the OS the script sees; see osType
 }
 
 var (
@@ -213,7 +215,42 @@ var (
 	}
 )
 
+// osType is what the sandbox reports as OSTYPE, the OS name bash carries from
+// the platform it was built for. Installers branch on it — mole's
+// `[[ "$OSTYPE" != "darwin"* ]]` — and under `set -u` an unset OSTYPE is a
+// fatal "unbound variable" rather than a branch not taken. Real bash bakes in
+// its build host's release, "darwin24.4.0" or "linux-gnu"; the release digits
+// go stale (a bash reporting darwin24.4.0 runs happily on a darwin25 kernel)
+// and scripts match the prefix, so report the bare name and no version, just
+// as the emulated `uname -r` reports a made-up release rather than a guess.
+//
+// unameOS is Emulation.UnameOS: with emulation on, OSTYPE follows the same
+// target as the fake `uname -s`, so a script cannot see a Linux uname and a
+// darwin OSTYPE at once.
+func osType(unameOS string) string {
+	name := strings.ToLower(unameOS)
+	if name == "" {
+		name = runtime.GOOS
+	}
+	switch name {
+	case "linux":
+		return "linux-gnu" // bash's spelling on glibc; still a "linux"* match
+	case "windows":
+		return "msys"
+	}
+	return name // darwin, freebsd, openbsd, netbsd, solaris, …
+}
+
+// osTypeVar is the OSTYPE entry for the maps below; bashVars cannot hold it
+// because its value depends on the run's emulation.
+func (e bashEnviron) osTypeVar() expand.Variable {
+	return expand.Variable{Set: true, Kind: expand.String, Str: e.ostype}
+}
+
 func (e bashEnviron) builtin(name string) expand.Variable {
+	if name == "OSTYPE" {
+		return e.osTypeVar()
+	}
 	if vr, ok := bashVars[name]; ok {
 		return vr
 	}
@@ -232,9 +269,9 @@ func (e bashEnviron) Get(name string) expand.Variable {
 
 func (e bashEnviron) Each(fn func(name string, vr expand.Variable) bool) {
 	e.Environ.Each(fn)
-	vars := bashVars
+	vars := maps.Clone(bashVars)
+	vars["OSTYPE"] = e.osTypeVar()
 	if e.posix {
-		vars = maps.Clone(bashVars)
 		maps.Copy(vars, posixVars)
 	}
 	for name, vr := range vars {
@@ -317,7 +354,7 @@ func buildRunner(cfg Config) (*interp.Runner, error) {
 	}
 	open := chainOpen(interp.DefaultOpenHandler(), opens...)
 	opts := []interp.RunnerOption{
-		interp.Env(bashEnviron{cfg.Env, cfg.Posix}),
+		interp.Env(bashEnviron{Environ: cfg.Env, posix: cfg.Posix, ostype: osType(e.UnameOS)}),
 		interp.Dir(cfg.Dir),
 		interp.IgnoreErrexit(cfg.Profile),
 		interp.StdIO(cfg.Stdin, cfg.Stdout, cfg.Stderr),

@@ -121,6 +121,15 @@ build replaces `mvdan.cc/sh` with the generated, untracked `third_party/sh`.
   bash judges only the statement itself: `if`/`{ }`/`for`/`while`/`case` bodies
   inherit their last statement's exemption, while a failing function call or
   subshell still exits. Every case in the test was checked against `/bin/bash`.
+- **`TestTrapSignalSpecs` / `TestTrapListsSignalTraps`** — the ninth patch:
+  upstream `trap` knew only `ERR` and `EXIT` and failed with status 2 on
+  anything else, so mole's `trap 'cleanup_installer; exit 130' INT TERM` ended
+  the installer on the spot under `set -e`. The patch accepts every spec bash
+  accepts — a name with or without the `SIG` prefix in any case, a signal
+  number, `EXIT` (`0`) and `ERR` — and records the signal ones so a bare `trap`
+  can list them. They are recorded, not delivered: nothing signals an
+  in-process script, so the point is that registering a cleanup handler is not
+  an error. Checked against `/bin/bash`.
 - **`TestCommandDefaultPathShim`** — `command -p NAME …` (warp's symlink
   activation) is rejected by mvdan/sh; the CallHandler drops the `-p`, since
   the command gate, not the lookup PATH, decides what may run.
@@ -132,6 +141,13 @@ build replaces `mvdan.cc/sh` with the generated, untracked `third_party/sh`.
   (keyword forms are `DeclClause` and don't), so `shimDeclarationBuiltin` rewrites
   a *bare* escaped declaration to a successful no-op, while passing anything with
   a `name=value` through untouched (never silently dropping an assignment).
+- **`TestOSTypeVisibleAndUnexported` and friends** — bash always defines
+  `OSTYPE`; mvdan/sh does not, so mole's platform guard
+  `[[ "$OSTYPE" != "darwin"* ]]` died as `OSTYPE: unbound variable` under
+  `set -u` before it could even be judged. The sandbox defines it alongside
+  `BASH_VERSION` — a shell variable, not an exported one — naming the OS the
+  script actually observes, so it follows the emulated `uname -s` when
+  target-OS emulation is on.
 - **`TestWiderAllowListAdvancesRVM`** — in strict mode the allow-list is the
   gate: grant every command the parser knows and rvm, having cleared mvdan/sh's
   `\typeset` gap via the typeset shim (below), is still **contained** by the

@@ -1,0 +1,134 @@
+--- a/interp/api.go
++++ b/interp/api.go
+@@ -187,6 +187,13 @@
+ 	// Fake signal callbacks
+ 	callbackErr  string
+ 	callbackExit string
++
++	// smash patch: callbacks registered for real signal specs, keyed by the
++	// bare upper-case signal name ("INT", "TERM"). Recorded but never
++	// delivered — the interpreter runs in-process and no signal reaches the
++	// script — so that `trap cleanup INT TERM` registers instead of failing,
++	// and so `trap` can list what a script asked for. See patches/sh/README.md.
++	callbackSig map[string]string
+ }
+ 
+ // exitStatus holds the state of the shell after running one command.
+--- a/interp/builtin.go
++++ b/interp/builtin.go
+@@ -9,6 +9,7 @@
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"maps"
+ 	"os"
+ 	"path/filepath"
+ 	"slices"
+@@ -950,6 +951,12 @@
+ 			}
+ 			if r.callbackErr != "" {
+ 				r.outf("trap -- %q ERR\n", r.callbackErr)
++			}
++			// smash patch: list the recorded signal traps too. bash prints
++			// these with the SIG prefix, and prints an ignored signal
++			// (`trap "" INT`) as an empty callback.
++			for _, name := range slices.Sorted(maps.Keys(r.callbackSig)) {
++				r.outf("trap -- %q SIG%s\n", r.callbackSig[name], name)
+ 			}
+ 		case 1:
+ 			// assume it's a signal, the default will be restored
+@@ -959,17 +966,34 @@
+ 		}
+ 		// For now, treat both empty and - the same since ERR and EXIT have no
+ 		// default callback.
+-		if callback == "-" {
++		// smash patch: for a real signal the two differ — `trap - INT`
++		// restores the default action while `trap "" INT` ignores the signal,
++		// and bash keeps listing the second one — so remember which was asked
++		// for.
++		restore := callback == "-"
++		if restore {
+ 			callback = ""
+ 		}
+ 		for _, arg := range args {
+-			switch arg {
++			// smash patch: accept every signal spec bash accepts, not just
++			// ERR and EXIT.
++			name, ok := trapSignal(arg)
++			if !ok {
++				return failf(2, "trap: %s: invalid signal specification\n", arg)
++			}
++			switch name {
+ 			case "ERR":
+ 				r.callbackErr = callback
+ 			case "EXIT":
+ 				r.callbackExit = callback
+ 			default:
+-				return failf(2, "trap: %s: invalid signal specification\n", arg)
++				if restore {
++					delete(r.callbackSig, name)
++				} else if r.callbackSig == nil {
++					r.callbackSig = map[string]string{name: callback}
++				} else {
++					r.callbackSig[name] = callback
++				}
+ 			}
+ 		}
+ 
+@@ -1266,3 +1290,56 @@
+ 	}
+ 	return "off"
+ }
++
++// smash patch: trapSignal canonicalises a `trap` signal spec to the bare
++// upper-case name bash lists it under, reporting whether bash would accept it
++// at all. bash takes a signal name with or without the SIG prefix in any case
++// ("int", "SIGINT"), a signal number ("2"), and the pseudo-signals EXIT (0)
++// and ERR. Upstream understood only ERR and EXIT and failed the builtin with
++// status 2 for anything else, which under `set -e` aborts every installer that
++// registers the usual `trap cleanup INT TERM`.
++func trapSignal(spec string) (string, bool) {
++	name := strings.ToUpper(spec)
++	if n, err := strconv.ParseUint(name, 10, 16); err == nil {
++		name, ok := trapSignalNumbers[n]
++		return name, ok
++	}
++	switch name {
++	case "EXIT", "ERR":
++		return name, true
++	}
++	if name = strings.TrimPrefix(name, "SIG"); slices.Contains(trapSignalNames, name) {
++		return name, true
++	}
++	return "", false
++}
++
++// trapSignalNumbers holds the signal numbers POSIX fixes to the same value on
++// every platform, so that a numeric spec means the same thing here as it does
++// to the host's shell. The signals whose numbers differ between Linux and
++// Darwin (USR1, USR2, BUS, SYS, …) are accepted by name only, which is how
++// scripts write them.
++var trapSignalNumbers = map[uint64]string{
++	0:  "EXIT",
++	1:  "HUP",
++	2:  "INT",
++	3:  "QUIT",
++	4:  "ILL",
++	5:  "TRAP",
++	6:  "ABRT",
++	8:  "FPE",
++	9:  "KILL",
++	11: "SEGV",
++	13: "PIPE",
++	14: "ALRM",
++	15: "TERM",
++}
++
++// trapSignalNames holds every signal name bash accepts on Linux or Darwin,
++// without the SIG prefix.
++var trapSignalNames = []string{
++	"ABRT", "ALRM", "BUS", "CHLD", "CLD", "CONT", "EMT", "FPE", "HUP", "ILL",
++	"INFO", "INT", "IO", "IOT", "KILL", "PIPE", "POLL", "PROF", "PWR", "QUIT",
++	"SEGV", "STKFLT", "STOP", "SYS", "TERM", "TRAP", "TSTP", "TTIN", "TTOU",
++	"URG", "USR1", "USR2", "VTALRM", "WINCH", "XCPU", "XFSZ",
++}
