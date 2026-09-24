@@ -97,11 +97,17 @@ type CurlParams struct {
 	Referer    string   `flag:"-e,--referer"`
 	Headers    []string `flag:"-H,--header" secret:"true"` // may carry Authorization
 	Cookies    []string `flag:"-b,--cookie" secret:"true"`
-	Data       []string `flag:"-d,--data,--data-raw,--data-binary,--data-urlencode" secret:"true"`
-	WriteOut   string   `flag:"-w,--write-out"`              // printed after the transfer; %{http_code} and %{url_effective} are supported
-	URL        string   `operand:"url" resource:"url,fetch"` // declared before Output so the log reads fetch-then-write
-	URLFlag    string   `flag:"--url" resource:"url,fetch"`  // curl's explicit spelling of the URL operand
-	Output     string   `flag:"-o,--output" resource:"path,write,stdout"`
+	// The data flags each have their own field because they differ in what a
+	// value means (@file or literal, newline stripping, URL-encoding) — see
+	// BodyParts — and rendering them under one spelling would change semantics.
+	Data          []string `flag:"-d,--data" secret:"true"`
+	DataRaw       []string `flag:"--data-raw" secret:"true"`
+	DataBinary    []string `flag:"--data-binary" secret:"true"`
+	DataURLEncode []string `flag:"--data-urlencode" secret:"true"`
+	WriteOut      string   `flag:"-w,--write-out"`              // printed after the transfer; %{http_code} and %{url_effective} are supported
+	URL           string   `operand:"url" resource:"url,fetch"` // declared before Output so the log reads fetch-then-write
+	URLFlag       string   `flag:"--url" resource:"url,fetch"`  // curl's explicit spelling of the URL operand
+	Output        string   `flag:"-o,--output" resource:"path,write,stdout"`
 }
 
 // The unmodelled value flags matter beyond politeness: a value flag the spec
@@ -138,7 +144,7 @@ var wgetSpec = specOf(WgetParams{}, true,
 	"-a", "--append-output", "--referer", "-t", "--tries", "-T", "--timeout",
 	"-w", "--wait", "--waitretry", "-P", "--directory-prefix", "--post-data", "--post-file",
 	"--ca-certificate", "--certificate", "--private-key", "--limit-rate",
-	"--user", "--password", "--http-user", "--http-password",
+	"--user", "--password", "--http-user", "--http-password", "--proxy-user", "--proxy-password",
 	"--bind-address", "--domains", "--exclude-domains", "--ciphers", "--secure-protocol")
 
 func wgetParamsFrom(p ParsedCommand) (w WgetParams) { bind(p, &w); return w }
@@ -276,115 +282,6 @@ var rsyncSpec = specOf(RsyncParams{}, true,
 func rsyncParamsFrom(p ParsedCommand) (r RsyncParams) { bind(p, &r); return r }
 func (r RsyncParams) Args() []string                  { return render("rsync", r, true) }
 func (r RsyncParams) String() string                  { return JoinArgs(r.Args()) }
-
-// DockerParams --------------------------------------------------------------
-
-// DockerParams models Docker-compatible CLIs (docker, podman, nerdctl). Name
-// retains the spelling used by the invocation. Rest holds subcommand-specific
-// flags that do not warrant dedicated fields, while Image and Arguments split
-// the container image from the command run inside it.
-type DockerParams struct {
-	Name       string
-	Config     string   `flag:"--config"`
-	Context    string   `flag:"--context"`
-	Debug      bool     `flag:"-D,--debug"`
-	Hosts      []string `flag:"-H,--host"`
-	LogLevel   string   `flag:"--log-level"`
-	TLS        bool     `flag:"--tls"`
-	TLSVerify  bool     `flag:"--tlsverify"`
-	TLSCACert  string   `flag:"--tlscacert"`
-	TLSCert    string   `flag:"--tlscert"`
-	TLSKey     string   `flag:"--tlskey"`
-	Subcommand string   `role:"subcommand"`
-	Rest       []string `role:"rest" secret:"--password"`
-	Image      string   `operand:"first"`
-	Arguments  []string `operand:"rest"`
-}
-
-func dockerParamsFrom(p ParsedCommand) (d DockerParams) {
-	bind(p, &d)
-	d.Name = p.Name
-	// -c and -l are global aliases but collide with run's --cpu-shares and
-	// --label. Bind them as globals only when they occur before the subcommand.
-	if value, ok := dockerGlobalShortValue(p, "-c"); ok {
-		d.Context = value
-		d.Rest = removeFlagPair(d.Rest, "-c", value)
-	}
-	if value, ok := dockerGlobalShortValue(p, "-l"); ok {
-		d.LogLevel = value
-		d.Rest = removeFlagPair(d.Rest, "-l", value)
-	}
-	return d
-}
-
-func dockerGlobalShortValue(p ParsedCommand, flag string) (string, bool) {
-	for i := 1; i < len(p.raw); i++ {
-		if p.raw[i] == p.Subcommand {
-			break
-		}
-		if p.raw[i] == flag && i+1 < len(p.raw) {
-			return p.raw[i+1], true
-		}
-	}
-	return "", false
-}
-
-func removeFlagPair(rest []string, flag, value string) []string {
-	out := make([]string, 0, len(rest))
-	removed := false
-	for i := 0; i < len(rest); i++ {
-		if !removed && rest[i] == flag && i+1 < len(rest) && rest[i+1] == value {
-			i++
-			removed = true
-			continue
-		}
-		out = append(out, rest[i])
-	}
-	return out
-}
-
-// Args renders global options before the subcommand, then retained subcommand
-// flags, the image, and any command arguments.
-func (d DockerParams) Args() []string {
-	name := d.Name
-	if name == "" {
-		name = "docker"
-	}
-	out := []string{name}
-	appendValue := func(flag, value string) {
-		if value != "" {
-			out = append(out, flag, value)
-		}
-	}
-	appendValue("--config", d.Config)
-	appendValue("--context", d.Context)
-	if d.Debug {
-		out = append(out, "--debug")
-	}
-	for _, host := range d.Hosts {
-		out = append(out, "--host", host)
-	}
-	appendValue("--log-level", d.LogLevel)
-	if d.TLS {
-		out = append(out, "--tls")
-	}
-	if d.TLSVerify {
-		out = append(out, "--tlsverify")
-	}
-	appendValue("--tlscacert", d.TLSCACert)
-	appendValue("--tlscert", d.TLSCert)
-	appendValue("--tlskey", d.TLSKey)
-	if d.Subcommand != "" {
-		out = append(out, d.Subcommand)
-	}
-	out = append(out, d.Rest...)
-	if d.Image != "" {
-		out = append(out, d.Image)
-	}
-	return append(out, d.Arguments...)
-}
-
-func (d DockerParams) String() string { return JoinArgs(d.Args()) }
 
 // PerlParams -----------------------------------------------------------------
 

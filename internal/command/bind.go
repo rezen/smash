@@ -32,7 +32,7 @@ import (
 )
 
 type boundField struct {
-	index   int
+	index   []int        // field index path (embedded structs flatten)
 	kind    reflect.Kind // Bool, String or Slice (of string)
 	flags   []string
 	operand string // "", "url", "first", "all"
@@ -42,14 +42,27 @@ type boundField struct {
 var fieldCache sync.Map // reflect.Type → []boundField
 
 // fieldsOf returns the tagged fields of a params struct type, validated once.
+// Anonymous embedded structs flatten in place, so families of commands can
+// share a common globals struct.
 func fieldsOf(t reflect.Type) []boundField {
 	if cached, ok := fieldCache.Load(t); ok {
 		return cached.([]boundField)
 	}
+	fields := collectFields(t, nil)
+	fieldCache.Store(t, fields)
+	return fields
+}
+
+func collectFields(t reflect.Type, base []int) []boundField {
 	var fields []boundField
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
-		f := boundField{index: i, kind: sf.Type.Kind()}
+		index := append(append([]int{}, base...), i)
+		if sf.Anonymous && sf.Type.Kind() == reflect.Struct {
+			fields = append(fields, collectFields(sf.Type, index)...)
+			continue
+		}
+		f := boundField{index: index, kind: sf.Type.Kind()}
 		if tag, ok := sf.Tag.Lookup("flag"); ok {
 			f.flags = strings.Split(tag, ",")
 		}
@@ -65,7 +78,6 @@ func fieldsOf(t reflect.Type) []boundField {
 		}
 		fields = append(fields, f)
 	}
-	fieldCache.Store(t, fields)
 	return fields
 }
 
@@ -95,7 +107,7 @@ func bind(p ParsedCommand, dst any) {
 	v := reflect.ValueOf(dst).Elem()
 	fields := fieldsOf(v.Type())
 	for _, f := range fields {
-		fv := v.Field(f.index)
+		fv := v.FieldByIndex(f.index)
 		switch {
 		case f.role == "subcommand":
 			fv.SetString(p.Subcommand)
@@ -153,20 +165,14 @@ func restFlags(p ParsedCommand, fields []boundField) []string {
 	return rest
 }
 
-// render turns a params struct back into argv: name, subcommand, then fields
-// in declaration order (adjacent short bool flags cluster into -sSfL when
-// clusterShort is set), rest flags where declared, operands last.
+// render turns a params struct back into argv: name, then fields in
+// declaration order (adjacent short bool flags cluster into -sSfL when
+// clusterShort is set) — so a subcommand field renders where it is declared,
+// after any global flags — rest flags where declared, operands last.
 func render(name string, src any, clusterShort bool) []string {
 	v := reflect.ValueOf(src)
 	fields := fieldsOf(v.Type())
 	out := []string{name}
-	for _, f := range fields {
-		if f.role == "subcommand" {
-			if s := v.Field(f.index).String(); s != "" {
-				out = append(out, s)
-			}
-		}
-	}
 	var short []byte
 	flush := func() {
 		if len(short) > 0 {
@@ -176,9 +182,13 @@ func render(name string, src any, clusterShort bool) []string {
 	}
 	var operands []string
 	for _, f := range fields {
-		fv := v.Field(f.index)
+		fv := v.FieldByIndex(f.index)
 		switch {
 		case f.role == "subcommand":
+			flush()
+			if s := fv.String(); s != "" {
+				out = append(out, s)
+			}
 		case f.role == "rest":
 			flush()
 			out = append(out, fv.Interface().([]string)...)

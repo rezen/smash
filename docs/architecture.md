@@ -80,10 +80,11 @@ syntax has different meaning. Examples include:
 ## Typed, reversible parameters
 
 Commands implementing `Structured` expose structs such as `CurlParams`,
-`SSHParams`, and `DockerParams`. Struct tags declare flags, operands, secrets,
-and resource semantics once. The binder derives parsing and rendering behavior
-from those tags, reducing drift between the accepted command line and the typed
-form.
+`SSHParams`, and `DockerRunParams`. Struct tags declare flags, operands,
+secrets, and resource semantics once. The binder derives parsing and rendering
+behavior from those tags, reducing drift between the accepted command line and
+the typed form. Anonymous embedded structs flatten, so a family of subcommands
+can share common fields (docker's `DockerGlobals`).
 
 Every `ParsedCommand` can render a normalized command line with `String()`.
 Where typed parameters exist, applications can inspect or edit the struct and
@@ -95,9 +96,14 @@ render it back to argv.
 
 ### Container CLIs
 
-`DockerCommand` models `docker`, `podman`, and `nerdctl`. `DockerParams`
-separates global daemon options, the subcommand, retained subcommand flags, the
-image, and arguments for the command inside the container. Registry-capable
+`DockerCommand` models `docker`, `podman`, and `nerdctl`. The grammar puts
+global daemon options before the subcommand, so parsing splits the argv there;
+that keeps overloaded short options unambiguous by position (`-c` is
+`--context` globally but `--cpu-shares` after `run`). Subcommand families with
+flags worth reading by name have their own params structs — `DockerRunParams`
+(mounts, published ports, capabilities, the command inside the container),
+`DockerBuildParams`, `DockerLoginParams`, `DockerExecParams` — each embedding
+`DockerGlobals`; the rest share the generic `DockerParams`. Registry-capable
 operations such as `pull`, `push`, `build`, and `run` implement `Networked` and
 remain subject to the egress guard.
 

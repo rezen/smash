@@ -71,14 +71,11 @@ func (Curl) Names() []string                       { return []string{"curl"} }
 func (Curl) Parse(a []string) ParsedCommand        { return curlSpec.Parse(a) }
 func (Curl) Egress(p ParsedCommand) (string, bool) { return urlOperand(p) }
 func (Curl) Params(p ParsedCommand) Params         { return curlParamsFrom(p) }
-func (Curl) Request(p ParsedCommand) Request {
-	r := curlParamsFrom(p).Request()
-	r.Body = curlBodyParts(p)
-	if len(r.Body) > 0 && r.Method == "" {
-		r.Method = "POST"
-	}
-	return r
-}
+func (Curl) Request(p ParsedCommand) Request       { return curlParamsFrom(p).Request() }
+
+// Curl accepts credentials on the command line (`-u user:password`). The flag
+// is unmodelled, so only the raw argv carries it — redact it there.
+func (Curl) SecretFlags() []string { return []string{"-u", "--user"} }
 
 // Request converts the typed params to a fetch intent.
 func (c CurlParams) Request() Request {
@@ -109,20 +106,22 @@ func (c CurlParams) Request() Request {
 	for _, ck := range c.Cookies {
 		r.Headers.Add("Cookie", ck)
 	}
-	for _, value := range c.Data {
-		r.Body = append(r.Body, RequestBodyPart{Value: value, StripNewlines: true})
-	}
-	if len(c.Data) > 0 && r.Method == "" {
+	r.Body = c.BodyParts()
+	if len(r.Body) > 0 && r.Method == "" {
 		r.Method = "POST"
 	}
 	return r
 }
 
-func curlBodyParts(p ParsedCommand) []RequestBodyPart {
+// BodyParts decodes the data fields into body pieces, each with its flag's
+// semantics: -d/--data strips newlines and treats @v as a file, --data-raw is
+// literal, --data-binary keeps newlines, --data-urlencode encodes and splits
+// an optional name= prefix.
+func (c CurlParams) BodyParts() []RequestBodyPart {
 	var parts []RequestBodyPart
-	add := func(values []string, raw, binary, encoded bool) {
+	add := func(values []string, raw, binary bool) {
 		for _, value := range values {
-			part := RequestBodyPart{Value: value, StripNewlines: !binary, URLEncode: encoded}
+			part := RequestBodyPart{Value: value, StripNewlines: !binary}
 			if !raw && strings.HasPrefix(value, "@") {
 				part.File = true
 				part.Value = strings.TrimPrefix(value, "@")
@@ -130,10 +129,10 @@ func curlBodyParts(p ParsedCommand) []RequestBodyPart {
 			parts = append(parts, part)
 		}
 	}
-	add(p.Values("-d", "--data"), false, false, false)
-	add(p.Values("--data-raw"), true, false, false)
-	add(p.Values("--data-binary"), false, true, false)
-	for _, value := range p.Values("--data-urlencode") {
+	add(c.Data, false, false)
+	add(c.DataRaw, true, false)
+	add(c.DataBinary, false, true)
+	for _, value := range c.DataURLEncode {
 		part := RequestBodyPart{URLEncode: true}
 		switch {
 		case strings.HasPrefix(value, "@"):
@@ -161,6 +160,9 @@ func (Wget) Parse(a []string) ParsedCommand        { return wgetSpec.Parse(a) }
 func (Wget) Egress(p ParsedCommand) (string, bool) { return urlOperand(p) }
 func (Wget) Params(p ParsedCommand) Params         { return wgetParamsFrom(p) }
 func (Wget) Request(p ParsedCommand) Request       { return wgetParamsFrom(p).Request() }
+
+// Wget's per-scheme password flags; the plain --password is a global secret.
+func (Wget) SecretFlags() []string { return []string{"--http-password", "--proxy-password"} }
 
 // Request converts the typed params to a fetch intent. wget always follows
 // redirects, and with no -O derives the output filename from the URL the way

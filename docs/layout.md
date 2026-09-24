@@ -32,7 +32,7 @@ internal/command/   the command model (pure; no interp dependency)
   registry.go   Registry (duplicate names rejected), Default, Set
   parse.go      Spec — the generic argv parser
   network.go    Curl/Wget/Openssl/SSH/Scp/Rsync/Netcat/Git/Perl/Python, Request + Downloader
-  docker.go     DockerCommand — Docker/Podman/Nerdctl parsing and registry egress
+  docker.go     DockerCommand — Docker/Podman/Nerdctl: split-argv parsing, per-subcommand params, registry egress
   shell.go      Shell + `-c` extraction
   wrappers.go   PrefixWrapper, Xargs, Unwrap
   builtins.go   Tool + the safe local tools, Grep/Sed/Awk/Tar/Base64/Find

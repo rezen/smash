@@ -56,6 +56,7 @@ type ParsedCommand struct {
 	cmd        Command
 	raw        []string // original argv, for order-sensitive params (e.g. find)
 	attached   Set      // flags whose value is glued on (`-i.bak`), for Args
+	subIndex   int      // raw index of Subcommand, for grammars that split there (docker); 0 = none
 	Name       string
 	Subcommand string
 	Flags      map[string][]string

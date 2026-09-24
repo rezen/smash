@@ -33,6 +33,48 @@ func TestCurlParams(t *testing.T) {
 	}
 }
 
+func TestCurlDataFlags(t *testing.T) {
+	// Each data flag keeps its own field, so a round trip keeps its semantics:
+	// --data-binary must not come back as -d (which strips newlines).
+	c := curlParamsFrom(Parse([]string{"curl", "-d", "a=1", "--data-raw", "@literal",
+		"--data-binary", "@body.bin", "--data-urlencode", "q=a b", "https://x"}))
+	if len(c.Data) != 1 || len(c.DataRaw) != 1 || len(c.DataBinary) != 1 || len(c.DataURLEncode) != 1 {
+		t.Fatalf("data fields wrong: %+v", c)
+	}
+	if got, want := c.String(), `curl -d a=1 --data-raw @literal --data-binary @body.bin --data-urlencode 'q=a b' https://x`; got != want {
+		t.Errorf("String() = %q, want %q", got, want)
+	}
+
+	parts := c.BodyParts()
+	if len(parts) != 4 {
+		t.Fatalf("BodyParts() = %d parts, want 4", len(parts))
+	}
+	if p := parts[0]; p.Value != "a=1" || p.File || !p.StripNewlines {
+		t.Errorf("-d part wrong: %+v", p)
+	}
+	if p := parts[1]; p.Value != "@literal" || p.File { // raw: @ is literal
+		t.Errorf("--data-raw part wrong: %+v", p)
+	}
+	if p := parts[2]; p.Value != "body.bin" || !p.File || p.StripNewlines {
+		t.Errorf("--data-binary part wrong: %+v", p)
+	}
+	if p := parts[3]; p.Prefix != "q=" || p.Value != "a b" || !p.URLEncode {
+		t.Errorf("--data-urlencode part wrong: %+v", p)
+	}
+
+	// Any body makes the request a POST unless -X overrides.
+	if r := (Curl{}).Request(Parse([]string{"curl", "--data-raw", "x", "https://x"})); r.Method != "POST" || len(r.Body) != 1 {
+		t.Errorf("Request with body wrong: %+v", r)
+	}
+}
+
+func TestCurlUserIsRedacted(t *testing.T) {
+	argv := strings.Join(Parse([]string{"curl", "-u", "alice:hunter2", "https://x"}).RedactedArgv(), " ")
+	if strings.Contains(argv, "hunter2") || !strings.Contains(argv, "-u REDACTED") {
+		t.Errorf("curl -u leaks credentials: %q", argv)
+	}
+}
+
 func TestOpensslParamsString(t *testing.T) {
 	p := Parse([]string{"openssl", "s_client", "-connect", "host:443", "-quiet"})
 	o, ok := p.TypedParams().(OpensslParams)
@@ -158,15 +200,15 @@ func TestSSHPerlAndPythonParams(t *testing.T) {
 func TestDockerParams(t *testing.T) {
 	p := Parse([]string{"docker", "--context", "remote", "run", "--name", "web", "--rm",
 		"alpine:3.20", "sh", "-c", "echo hi"})
-	d, ok := p.TypedParams().(DockerParams)
+	d, ok := p.TypedParams().(DockerRunParams)
 	if !ok {
-		t.Fatalf("TypedParams() = %T, want DockerParams", p.TypedParams())
+		t.Fatalf("TypedParams() = %T, want DockerRunParams", p.TypedParams())
 	}
 	if d.Name != "docker" || d.Context != "remote" || d.Subcommand != "run" || d.Image != "alpine:3.20" {
 		t.Errorf("fields wrong: %+v", d)
 	}
-	if got, want := strings.Join(d.Rest, " "), "--name web --rm"; got != want {
-		t.Errorf("Rest = %q, want %q", got, want)
+	if d.ContainerName != "web" || !d.Remove || len(d.Rest) != 0 {
+		t.Errorf("run flags not typed: %+v", d)
 	}
 	if got, want := strings.Join(d.Arguments, " "), "sh -c echo hi"; got != want {
 		t.Errorf("Arguments = %q, want %q", got, want)
@@ -183,9 +225,12 @@ func TestDockerParams(t *testing.T) {
 
 	// A value-taking run flag must not become the image, and flags for the
 	// command inside the container must remain trailing arguments.
-	run := Parse([]string{"nerdctl", "run", "-p", "8080:80", "nginx", "nginx", "-g", "daemon off;"}).TypedParams().(DockerParams)
+	run := Parse([]string{"nerdctl", "run", "-p", "8080:80", "nginx", "nginx", "-g", "daemon off;"}).TypedParams().(DockerRunParams)
 	if run.Image != "nginx" || strings.Join(run.Arguments, " ") != "nginx -g daemon off;" {
 		t.Errorf("Nerdctl run params wrong: %+v", run)
+	}
+	if len(run.Publish) != 1 || run.Publish[0] != "8080:80" {
+		t.Errorf("Publish = %v, want [8080:80]", run.Publish)
 	}
 
 	// Global short options are typed, while the same spelling after `run`
@@ -194,9 +239,47 @@ func TestDockerParams(t *testing.T) {
 	if global.Context != "remote" || len(global.Rest) != 0 {
 		t.Errorf("global -c params wrong: %+v", global)
 	}
-	cpu := Parse([]string{"docker", "run", "-c", "512", "alpine"}).TypedParams().(DockerParams)
+	cpu := Parse([]string{"docker", "run", "-c", "512", "alpine"}).TypedParams().(DockerRunParams)
 	if cpu.Context != "" || strings.Join(cpu.Rest, " ") != "-c 512" || cpu.Image != "alpine" {
 		t.Errorf("run -c params wrong: %+v", cpu)
+	}
+}
+
+func TestDockerFamilyParams(t *testing.T) {
+	// run: what the container mounts, exposes and runs as is typed.
+	r := Parse([]string{"docker", "run", "--rm", "-v", "/host:/data", "--mount", "type=bind,src=/,dst=/mnt",
+		"-e", "TOKEN=x", "--network", "host", "--privileged", "-u", "root", "--cap-add", "SYS_ADMIN",
+		"alpine", "sh"}).TypedParams().(DockerRunParams)
+	if strings.Join(r.Volumes, " ") != "/host:/data" || len(r.Mounts) != 1 || len(r.Env) != 1 ||
+		r.Network != "host" || !r.Privileged || r.User != "root" || strings.Join(r.CapAdd, " ") != "SYS_ADMIN" {
+		t.Errorf("run params wrong: %+v", r)
+	}
+	if r.Image != "alpine" || strings.Join(r.Arguments, " ") != "sh" {
+		t.Errorf("run image/arguments wrong: %+v", r)
+	}
+
+	// build: -t is the image tag (a value), --pull a bool, first operand the context.
+	b := Parse([]string{"docker", "build", "-t", "app:latest", "-f", "Dockerfile.ci",
+		"--build-arg", "V=1", "--pull", "."}).TypedParams().(DockerBuildParams)
+	if strings.Join(b.Tags, " ") != "app:latest" || b.File != "Dockerfile.ci" ||
+		strings.Join(b.BuildArgs, " ") != "V=1" || !b.Pull || b.Path != "." {
+		t.Errorf("build params wrong: %+v", b)
+	}
+	// Rendering uses the long canonical spelling, so audit lines self-describe.
+	if got, want := b.String(), "docker build --file Dockerfile.ci --tag app:latest --build-arg V=1 --pull ."; got != want {
+		t.Errorf("build String() = %q, want %q", got, want)
+	}
+
+	// exec: who runs what in which container.
+	e := Parse([]string{"docker", "exec", "-u", "root", "-w", "/app", "web", "ls", "-la"}).TypedParams().(DockerExecParams)
+	if e.User != "root" || e.Workdir != "/app" || e.Container != "web" || strings.Join(e.Arguments, " ") != "ls -la" {
+		t.Errorf("exec params wrong: %+v", e)
+	}
+
+	// ps -l is --latest, a bool: it must not swallow the next argument.
+	ps := Parse([]string{"docker", "ps", "-l", "-q"}).TypedParams().(DockerParams)
+	if got, want := strings.Join(ps.Rest, " "), "-l -q"; got != want {
+		t.Errorf("ps Rest = %q, want %q", got, want)
 	}
 }
 

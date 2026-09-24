@@ -37,6 +37,7 @@ func (o Spec) Parse(args []string) ParsedCommand {
 		case a == "-" || !strings.HasPrefix(a, "-"):
 			if wantSub {
 				p.Subcommand, wantSub = a, false
+				p.subIndex = i + 1 // its index in args (rest starts at args[1])
 				continue
 			}
 			if o.StopAtOperand {

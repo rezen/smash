@@ -193,7 +193,10 @@ func TestRedact(t *testing.T) {
 	if got := h.String(); strings.Contains(got, "topsecret") || !strings.Contains(got, "-hmac REDACTED") {
 		t.Errorf("rest redaction wrong: %q", got)
 	}
-	d := Redact(Parse([]string{"docker", "login", "--username", "bob", "--password", "hunter2", "registry.example"}).TypedParams()).(DockerParams)
+	d := Redact(Parse([]string{"docker", "login", "--username", "bob", "--password", "hunter2", "registry.example"}).TypedParams()).(DockerLoginParams)
+	if d.Password != Redacted || d.Username != "bob" {
+		t.Errorf("docker login redaction wrong: %+v", d)
+	}
 	if got := d.String(); strings.Contains(got, "hunter2") || !strings.Contains(got, "--password REDACTED") {
 		t.Errorf("docker password redaction wrong: %q", got)
 	}
