@@ -16,14 +16,30 @@ func TestProfilerBuildsStableManifest(t *testing.T) {
 		Resources: []command.Resource{
 			{Kind: "url", Action: "fetch", Value: "https://Downloads.Example.test/tool"},
 		},
-		// What the in-process downloader observed: the redirect hop and the
-		// response's declared media type.
-		Via:         []string{"downloads.example.test", "objects.example.test"},
+		// What the in-process downloader observed: the redirect hops and the
+		// response's declared media type. An api.github.com hop scopes to its
+		// owner/repo; an opaque asset host stays host-level.
+		Via: []string{
+			"https://downloads.example.test/tool",
+			"https://api.github.com/repos/gruntwork-io/terragrunt/releases/latest",
+			"https://objects.example.test/bucket/uuid",
+		},
 		ContentType: "application/gzip",
 		Sniffed:     "application/x-gzip",
 	})
 	p.Audit(sandbox.AuditRecord{Name: "uname"})
-	p.Audit(sandbox.AuditRecord{Name: "curl"})
+	p.Audit(sandbox.AuditRecord{ // a project-shaped fetch scopes to owner/repo
+		Name: "curl",
+		Resources: []command.Resource{
+			{Kind: "url", Action: "fetch", Value: "https://github.com/atuinsh/atuin/releases/latest/download/x"},
+		},
+	})
+	p.Audit(sandbox.AuditRecord{ // too short to name a project → host fallback
+		Name: "curl",
+		Resources: []command.Resource{
+			{Kind: "url", Action: "fetch", Value: "https://github.com/atuinsh"},
+		},
+	})
 	p.Audit(sandbox.AuditRecord{
 		Name: "git",
 		Resources: []command.Resource{
@@ -37,8 +53,11 @@ func TestProfilerBuildsStableManifest(t *testing.T) {
 	if got := strings.Join(m.Commands, ","); got != "curl,git,uname" {
 		t.Errorf("commands = %s", got)
 	}
+	if got := strings.Join(m.URLs, ","); got != "https://api.github.com/repos/gruntwork-io/terragrunt,https://github.com/atuinsh/atuin" {
+		t.Errorf("urls = %s (project-shaped URLs must scope to owner/repo)", got)
+	}
 	if got := strings.Join(m.Hosts, ","); got != "downloads.example.test,github.com,objects.example.test" {
-		t.Errorf("hosts = %s (redirect-hop hosts must be recorded)", got)
+		t.Errorf("hosts = %s (non-project URLs, hops and git remotes stay host-level)", got)
 	}
 	if got := strings.Join(m.MIMETypes, ","); got != "application/gzip" {
 		t.Errorf("mime-types = %s (the declared type, never the sniffed one)", got)
@@ -58,6 +77,7 @@ func TestProfilerBuildsStableManifest(t *testing.T) {
 func TestManifestRoundTripAndApply(t *testing.T) {
 	m := New("x.sh", "df\n")
 	m.Commands = []string{"df"}
+	m.URLs = []string{"https://github.com/o/r"}
 	m.Hosts = []string{"downloads.example.test"}
 	m.MIMETypes = []string{"application/gzip", "text/*"}
 	path := t.TempDir() + "/manifest.yaml"
@@ -79,9 +99,33 @@ func TestManifestRoundTripAndApply(t *testing.T) {
 	if !cfg.Network.AllowsTarget("https://downloads.example.test/tool") || cfg.Network.AllowsTarget("https://other.test/tool") {
 		t.Errorf("manifest host policy did not apply")
 	}
+	// The urls entry is a whole-segment, scheme-pinned prefix grant: one
+	// project, not the forge.
+	if !cfg.Network.AllowsTarget("https://github.com/o/r/releases/download/v1/x") {
+		t.Errorf("the recorded project prefix must admit its release downloads")
+	}
+	for _, target := range []string{
+		"https://github.com/o/other/releases/download/v1/x",
+		"https://github.com/other/r/x",
+		"http://github.com/o/r/x", // prefix grants pin the scheme
+	} {
+		if cfg.Network.AllowsTarget(target) {
+			t.Errorf("%s should not be admitted by the o/r prefix", target)
+		}
+	}
 	if !cfg.Network.AllowsMIME("application/gzip") || !cfg.Network.AllowsMIME("text/x-shellscript") ||
 		cfg.Network.AllowsMIME("application/octet-stream") {
 		t.Errorf("manifest mime-types did not apply: %v", cfg.Network.AllowedMIMETypes)
+	}
+}
+
+// TestManifestURLsValidated: like a schemeless policy prefix, a malformed
+// urls entry would fail closed silently at enforce time; Load refuses it.
+func TestManifestURLsValidated(t *testing.T) {
+	m := New("x.sh", "df\n")
+	m.URLs = []string{"github.com/o/r"}
+	if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "urls") {
+		t.Errorf("a schemeless urls entry should be refused; got %v", err)
 	}
 }
 

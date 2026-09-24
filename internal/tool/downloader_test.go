@@ -74,10 +74,12 @@ func TestClassifyMIME(t *testing.T) {
 	}
 }
 
-// TestHopHosts: net/http leaves the redirect chain hanging off the final
+// TestHopURLs: net/http leaves the redirect chain hanging off the final
 // response — resp.Request is the last request, each earlier hop reachable
-// through Request.Response. The walk must come back chronological and deduped.
-func TestHopHosts(t *testing.T) {
+// through Request.Response. The walk must come back chronological, as full
+// URLs (the manifest profiler scopes project-shaped hops by path), deduped
+// by exact URL.
+func TestHopURLs(t *testing.T) {
 	mkURL := func(raw string) *url.URL {
 		u, err := url.Parse(raw)
 		if err != nil {
@@ -89,16 +91,19 @@ func TestHopHosts(t *testing.T) {
 	firstResp := &http.Response{Request: first}
 	second := &http.Request{URL: mkURL("https://objects.githubusercontent.com/asset"), Response: firstResp}
 	secondResp := &http.Response{Request: second}
-	third := &http.Request{URL: mkURL("https://objects.githubusercontent.com/real"), Response: secondResp}
+	// A loop back to an already-seen URL dedupes; a different path on the
+	// same host does not.
+	third := &http.Request{URL: mkURL("https://objects.githubusercontent.com/asset"), Response: secondResp}
 	final := &http.Response{Request: third}
 
-	got := strings.Join(hopHosts(final), ",")
-	if got != "github.com,objects.githubusercontent.com" {
-		t.Errorf("hopHosts = %s, want chronological and deduped", got)
+	got := strings.Join(hopURLs(final), ",")
+	want := "https://github.com/o/r/releases/download/v1/x,https://objects.githubusercontent.com/asset"
+	if got != want {
+		t.Errorf("hopURLs = %s, want %s", got, want)
 	}
 	single := &http.Response{Request: first}
-	if got := strings.Join(hopHosts(single), ","); got != "github.com" {
-		t.Errorf("hopHosts(no redirects) = %s", got)
+	if got := strings.Join(hopURLs(single), ","); got != "https://github.com/o/r/releases/download/v1/x" {
+		t.Errorf("hopURLs(no redirects) = %s", got)
 	}
 }
 

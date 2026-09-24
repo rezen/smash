@@ -6,10 +6,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 
 	"gopkg.in/yaml.v3"
@@ -21,14 +23,22 @@ import (
 
 const Version = 1
 
-// Manifest is a reviewed profile for one exact script body. Commands and
-// Hosts are sorted and de-duplicated when a profile is written.
+// Manifest is a reviewed profile for one exact script body. The list fields
+// are sorted and de-duplicated when a profile is written.
 type Manifest struct {
 	Version  int      `yaml:"version"`
 	OS       string   `yaml:"os,omitempty"`
 	Script   Script   `yaml:"script"`
 	Commands []string `yaml:"commands"`
-	Hosts    []string `yaml:"hosts"`
+	// URLs are owner/repo URL prefixes for project-shaped GitHub-family
+	// downloads, applied as sandbox.Policy.AllowedPrefixes (scheme-pinned,
+	// whole-segment matching) — so a profiled GitHub fetch grants one
+	// project, not the whole forge. The Profiler records them via
+	// sandbox.GitHubProjectPrefix; hosts whose paths carry no project
+	// identity (non-GitHub vendors, GitHub's opaque uuid/hash asset hosts)
+	// stay in Hosts. Any valid URL prefix is accepted when hand-editing.
+	URLs  []string `yaml:"urls,omitempty"`
+	Hosts []string `yaml:"hosts"`
 	// MIMETypes, when present, is the response-body MIME allow-list applied
 	// on top of the hosts (see sandbox.Policy.AllowedMIMETypes). The Profiler
 	// records the declared media types it observed — downloads run through
@@ -85,6 +95,11 @@ func (m Manifest) Validate() error {
 	for _, name := range m.Commands {
 		if name == "" || filepath.Base(name) != name {
 			return fmt.Errorf("invalid manifest command %q: use a command name, not a path", name)
+		}
+	}
+	for _, entry := range m.URLs {
+		if err := sandbox.ValidateURLPrefix(entry); err != nil {
+			return fmt.Errorf("manifest urls: %w", err)
 		}
 	}
 	for _, host := range m.Hosts {
@@ -156,14 +171,16 @@ func (m Manifest) Write(path string) error {
 	return nil
 }
 
-// Apply makes the manifest the command and host authority for cfg. Other
+// Apply makes the manifest the command and network authority for cfg: URLs
+// become the run's prefix grants (scheme-pinned, whole-segment), Hosts its
+// exact host grants, and Hosts alone feed explicitly allowed Git. Other
 // policy controls (mocks, limits, disabled commands, environment) stay
 // intact, as does a policy's MIME allow-list unless the manifest states its
 // own.
 func (m Manifest) Apply(cfg *sandbox.Config) {
 	cfg.Strict = true
 	cfg.Allowed = command.NewSet(m.Commands...)
-	cfg.Network.AllowedPrefixes = nil
+	cfg.Network.AllowedPrefixes = append([]string(nil), m.URLs...)
 	cfg.Network.AllowedHosts = append([]string(nil), m.Hosts...)
 	cfg.Network.GitHosts = append([]string(nil), m.Hosts...)
 	if m.MIMETypes != nil {
@@ -179,6 +196,7 @@ type Profiler struct {
 	mu         sync.Mutex
 	manifest   Manifest
 	commands   map[string]bool
+	urls       map[string]bool
 	hosts      map[string]bool
 	mimeTypes  map[string]bool
 	sawUntyped bool // a download body arrived without a parseable declared type
@@ -187,7 +205,8 @@ type Profiler struct {
 func NewProfiler(name, source string, next sandbox.Auditor) *Profiler {
 	return &Profiler{
 		Next: next, manifest: New(name, source),
-		commands: map[string]bool{}, hosts: map[string]bool{}, mimeTypes: map[string]bool{},
+		commands: map[string]bool{}, urls: map[string]bool{},
+		hosts: map[string]bool{}, mimeTypes: map[string]bool{},
 	}
 }
 
@@ -197,16 +216,16 @@ func (p *Profiler) Audit(rec sandbox.AuditRecord) {
 		p.commands[filepath.Base(rec.Name)] = true
 	}
 	for _, resource := range rec.Resources {
-		if host := resourceHost(resource); host != "" {
+		if resource.Kind == "url" {
+			p.recordURL(resource.Value)
+		} else if host := resourceHost(resource); host != "" {
 			p.hosts[host] = true
 		}
 	}
-	// The in-process downloader observes what parsed argv cannot: the host of
+	// The in-process downloader observes what parsed argv cannot: the URL of
 	// every redirect hop, and the response's declared media type.
-	for _, host := range rec.Via {
-		if host != "" {
-			p.hosts[host] = true
-		}
+	for _, hop := range rec.Via {
+		p.recordURL(hop)
 	}
 	if rec.ContentType != "" {
 		p.mimeTypes[rec.ContentType] = true
@@ -233,6 +252,9 @@ func (p *Profiler) Manifest() Manifest {
 	for name := range p.commands {
 		m.Commands = append(m.Commands, name)
 	}
+	for prefix := range p.urls {
+		m.URLs = append(m.URLs, prefix)
+	}
 	for host := range p.hosts {
 		m.Hosts = append(m.Hosts, host)
 	}
@@ -242,17 +264,39 @@ func (p *Profiler) Manifest() Manifest {
 		}
 	}
 	sort.Strings(m.Commands)
+	sort.Strings(m.URLs)
 	sort.Strings(m.Hosts)
 	sort.Strings(m.MIMETypes)
 	return m
 }
 
+// recordURL classifies one observed URL — an argv fetch target or a redirect
+// hop: a project-shaped GitHub-family URL becomes an owner/repo prefix in
+// urls; everything else falls back to its host. Both spellings come from the
+// SAME parsers (sandbox.GitHubProjectPrefix, network.HostFromEndpoint) that
+// enforcement matches with, so recording and matching cannot drift apart.
+func (p *Profiler) recordURL(raw string) {
+	if strings.Contains(raw, "://") {
+		if u, err := url.Parse(raw); err == nil {
+			if prefix, ok := sandbox.GitHubProjectPrefix(u); ok {
+				p.urls[prefix] = true
+				return
+			}
+		}
+	}
+	if host := network.HostFromEndpoint(raw); host != "" {
+		p.hosts[host] = true
+	}
+}
+
 // resourceHost extracts the host a network-ish resource touched, with the
 // SAME parser (network.HostFromEndpoint) Policy.AllowsTarget will use when
-// this manifest is later enforced — recording and matching cannot drift apart.
+// this manifest is later enforced — recording and matching cannot drift
+// apart. Resources of kind "url" go through recordURL instead, where a
+// project-shaped GitHub URL keeps its owner/repo path.
 func resourceHost(r command.Resource) string {
 	switch r.Kind {
-	case "url", "repo", "remote", "host", "socket", "keyserver":
+	case "repo", "remote", "host", "socket", "keyserver":
 	default:
 		return ""
 	}

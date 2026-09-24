@@ -216,10 +216,16 @@ log destination accordingly.
 
 ## Profile manifests
 
-A profile manifest associates an observed command/host set with the profiling
-OS and binds it to the SHA-256 of the script bytes. Enforcing it rejects a
-different OS or changed script and turns the observed commands and exact hosts
-into strict grants. A `mime-types` list additionally applies the response MIME
+A profile manifest associates an observed command and network surface with
+the profiling OS and binds it to the SHA-256 of the script bytes. Enforcing
+it rejects a different OS or changed script and turns the observed commands,
+owner/repo GitHub URL prefixes, and exact hosts into strict grants. The
+`urls` list scopes project-shaped GitHub-family downloads to the owner/repo
+that was actually observed — including redirect hops — instead of granting
+the whole forge; those prefixes also pin the scheme, unlike host grants.
+GitHub's opaque uuid/hash asset hosts carry no project identity in their
+paths and stay host-level in `hosts`, as does everything non-GitHub. A
+`mime-types` list additionally applies the response MIME
 gate described under the download policy; the profiler records the declared
 types it observed (and omits the list whenever a download body arrived without
 a parseable `Content-Type`, since enforcement would then deny the profiled

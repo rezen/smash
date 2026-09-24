@@ -24,7 +24,6 @@ import (
 	"mvdan.cc/sh/v3/interp"
 
 	"github.com/rezen/smash/internal/command"
-	"github.com/rezen/smash/internal/network"
 )
 
 // DownloaderConfig supplies the network and filesystem decisions owned by
@@ -156,7 +155,7 @@ func runDownloader(ctx context.Context, cfg DownloaderConfig, name string, req c
 	defer resp.Body.Close()
 	note := ResponseNoteFrom(ctx)
 	if note != nil {
-		note.Via = hopHosts(resp)
+		note.Via = hopURLs(resp)
 	}
 	if req.FailOnHTTP && resp.StatusCode >= 400 {
 		return Failf(hc.Stderr, 22, "%s: The requested URL returned error: %d", name, resp.StatusCode)
@@ -247,26 +246,28 @@ func checkMIME(allow func(string) bool, contentType string, peek []byte) (declar
 	return declared, sniffed, nil
 }
 
-// hopHosts walks the redirect chain net/http leaves on a response —
+// hopURLs walks the redirect chain net/http leaves on a response —
 // resp.Request is the FINAL request; each earlier hop hangs off
-// Request.Response — and returns the canonical host of every hop, initial
-// request first, deduplicated preserving first occurrence.
-func hopHosts(resp *http.Response) []string {
+// Request.Response — and returns the full URL of every hop, initial request
+// first, deduplicated preserving first occurrence. Consumers derive what
+// they need: the audit log renders hosts, the manifest profiler scopes
+// project-shaped URLs by path.
+func hopURLs(resp *http.Response) []string {
 	var reversed []string
 	for r := resp; r != nil && r.Request != nil; r = r.Request.Response {
-		if h := network.HostFromURL(r.Request.URL); h != "" {
-			reversed = append(reversed, h)
+		if r.Request.URL != nil {
+			reversed = append(reversed, r.Request.URL.String())
 		}
 	}
-	var hosts []string
+	var urls []string
 	seen := map[string]bool{}
 	for i := len(reversed) - 1; i >= 0; i-- {
 		if !seen[reversed[i]] {
 			seen[reversed[i]] = true
-			hosts = append(hosts, reversed[i])
+			urls = append(urls, reversed[i])
 		}
 	}
-	return hosts
+	return urls
 }
 
 // sniffAllowed reports whether the sniffed type is acceptable: allowed

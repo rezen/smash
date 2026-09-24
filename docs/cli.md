@@ -58,9 +58,9 @@ audit target is a file or disabled.
 |---|---:|---|
 | `-policy FILE` | — | Read the base configuration from a YAML policy file |
 | `-init-policy FILE` | — | Write a commented policy template and exit; `-` writes to stdout |
-| `-profile` | false | Run and write the script SHA-256 plus observed commands, hosts (redirect hops included), and response media types to a manifest |
+| `-profile` | false | Run and write the script SHA-256 plus observed commands, GitHub owner/repo URL prefixes, hosts (redirect hops included), and response media types to a manifest |
 | `-profile-output FILE` | `<script>.manifest.yaml` | Set the generated manifest path; requires `-profile` |
-| `-manifest FILE` | — | Verify the script SHA-256 and restrict commands and hosts to a manifest |
+| `-manifest FILE` | — | Verify the script SHA-256 and restrict commands, URL prefixes, and hosts to a manifest |
 | `-urls p1,p2` | GitHub's common download hosts | Replace the URL prefixes available to in-process `curl` and `wget` |
 | `-urls-github` | false | Add GitHub API, raw, codeload, objects, and release-asset hosts |
 | `-git-hosts h1,h2` | GitHub, GitLab, Bitbucket | Advisory host checks for explicitly allowed real Git operations |
@@ -98,12 +98,25 @@ commands:
   - curl
   - mkdir
   - tar
+urls:
+  - https://github.com/example/tool
 hosts:
   - downloads.example.com
+  - release-assets.githubusercontent.com
 ```
 
+Alongside the manifest, the run's full audit trail is written to a sidecar
+log named after it (`install.manifest.yaml` → `install.manifest.log`) — the
+evidence behind each recorded grant, for the review step. It is written in
+addition to whatever `-audit` selects.
+
 `os` uses Go's canonical operating-system name (such as `linux` or `darwin`).
-Commands, hosts, and media types are sorted and de-duplicated. Profiling is
+Commands, URL prefixes, hosts, and media types are sorted and de-duplicated.
+Project-shaped GitHub-family URLs (`github.com`, `raw.githubusercontent.com`,
+`codeload.github.com`, and `api.github.com`'s `/repos/…`) are recorded in
+`urls` scoped to their owner/repo — one project, not the whole forge — while
+hosts whose paths carry no project identity (other vendors, GitHub's opaque
+uuid/hash asset hosts) are recorded in `hosts`. Profiling is
 discovery mode: the audit and profile collectors remain active, but Smash
 bypasses its disabled and sensitive command gates, strict mode, mocks, general
 egress guard, sleep cap, in-root native executable gate, and raw-socket guard.
@@ -134,10 +147,11 @@ smash -manifest install.manifest.yaml install.sh
 The script is loaded first and its bytes must match `script.sha256`; a remote
 script is therefore verified after its initial fetch and before execution. A
 manifest that names a different OS is also rejected. The manifest then enables
-strict command gating, replaces the command allow-list,
-replaces URL-prefix grants with exact host grants, and uses the same host set
-for explicitly allowed Git. Other policy settings such as mocks, environment,
-timeouts, request limits, and disabled commands still apply.
+strict command gating and replaces the command allow-list; its `urls` become
+the run's URL-prefix grants (whole-segment matching that also pins the
+scheme) and its `hosts` become exact host grants, with the host set alone
+feeding explicitly allowed Git. Other policy settings such as mocks,
+environment, timeouts, request limits, and disabled commands still apply.
 
 A manifest may also carry a `mime-types` list — the same response-body MIME
 allow-list as a policy file's `network.mime-types` (bare media types or

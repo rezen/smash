@@ -139,7 +139,24 @@ func runCLI(argv []string) error {
 	defer cleanup()
 
 	var profiler *profilemanifest.Profiler
+	var profileLog string
 	if fl.profile {
+		// The audit trail is the manifest's evidence — what the run actually
+		// did — so a profile always writes it next to the manifest
+		// (atuin.manifest.yaml → atuin.manifest.log), in addition to
+		// whatever -audit selected.
+		profileLog = manifestLogPath(fl.profileOutput)
+		logFile, err := os.Create(profileLog)
+		if err != nil {
+			return fmt.Errorf("profile audit log: %w", err)
+		}
+		defer logFile.Close()
+		logAuditor := sandbox.TextAuditor(logFile, sandbox.ShortPaths(cfg))
+		if cfg.Auditor != nil {
+			cfg.Auditor = sandbox.MultiAuditor(cfg.Auditor, logAuditor)
+		} else {
+			cfg.Auditor = logAuditor
+		}
 		profiler = profilemanifest.NewProfiler(name, script, cfg.Auditor)
 		cfg.Auditor = profiler
 	}
@@ -156,7 +173,7 @@ func runCLI(argv []string) error {
 	}
 	writeErr := profiler.Manifest().Write(fl.profileOutput)
 	if writeErr == nil {
-		fmt.Fprintf(os.Stderr, "wrote profile manifest %s\n", fl.profileOutput)
+		fmt.Fprintf(os.Stderr, "wrote profile manifest %s (audit log %s)\n", fl.profileOutput, profileLog)
 	} else {
 		writeErr = fmt.Errorf("writing profile manifest %s: %w", fl.profileOutput, writeErr)
 	}
@@ -373,6 +390,12 @@ func wireAudit(pol *policy.File, fl *cliFlags, cfg *sandbox.Config) (*splitview.
 		cleanup = func() { f.Close() }
 	}
 	return nil, cleanup, nil
+}
+
+// manifestLogPath is the audit-log companion of a manifest path:
+// atuin.manifest.yaml → atuin.manifest.log.
+func manifestLogPath(manifestPath string) string {
+	return strings.TrimSuffix(manifestPath, filepath.Ext(manifestPath)) + ".log"
 }
 
 func defaultManifestPath(scriptName string) string {

@@ -48,7 +48,7 @@ func Failf(w io.Writer, code int, format string, args ...any) error {
 type ResponseNote struct {
 	ContentType string   // declared Content-Type, parameters stripped; "" when absent or unparseable
 	Sniffed     string   // what the first body bytes are: http.DetectContentType sharpened by refineSniff (tar/xz/executables/shebangs…)
-	Via         []string // canonical host of every response hop, initial request first, deduped
+	Via         []string // full URL of every response hop, initial request first, deduped
 }
 
 type responseNoteKey struct{}

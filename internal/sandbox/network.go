@@ -45,12 +45,16 @@ type Policy struct {
 	// "https://example.com/pkg/v1" but neither "https://example.com/pkgs" nor
 	// "https://example.com.evil.test/pkg". A trailing slash on an entry means
 	// nothing; name a subdomain explicitly rather than expecting one to be
-	// covered by its parent. Use Validate to reject entries that are not URL
-	// prefixes at all — those match nothing. See Allows.
+	// covered by its parent. Note the asymmetry with AllowedHosts: a prefix
+	// pins the scheme, a host grant does not. Use Validate to reject entries
+	// that are not URL prefixes at all — those match nothing. See Allows.
 	AllowedPrefixes []string
-	// AllowedHosts grants every HTTP(S) URL on an exact host. It is primarily
-	// used by a generated profile manifest, whose contract records hosts rather
-	// than paths. Unlike GitHosts, parent hosts do not grant subdomains.
+	// AllowedHosts grants every HTTP(S) URL on an exact host, any scheme. It
+	// is primarily used by a generated profile manifest for hosts whose paths
+	// carry no project identity — non-GitHub vendors and GitHub's opaque
+	// asset hosts; a manifest's project-shaped GitHub URLs are recorded as
+	// owner/repo entries in AllowedPrefixes instead (see GitHubProjectPrefix).
+	// Unlike GitHosts, parent hosts do not grant subdomains.
 	AllowedHosts   []string
 	AllowedMethods map[string]bool // HTTP methods a downloader may use
 	// AllowedMIMETypes is the response-body MIME allow-list the in-process
@@ -98,6 +102,43 @@ func GitHubPrefixes() []string {
 		"https://objects.githubusercontent.com/",
 		"https://release-assets.githubusercontent.com/",
 	}
+}
+
+// GitHubProjectPrefix reports the owner/repo URL prefix a project-shaped
+// GitHub-family URL falls under ("https://github.com/OWNER/REPO",
+// "https://api.github.com/repos/OWNER/REPO"), or false when the URL is not
+// project-shaped: an opaque asset host (objects/release-assets, whose paths
+// are per-release uuid/hash buckets), a path too short to name a project, a
+// non-HTTP scheme, a non-default port, or a URL that disguises its host.
+// Segments are kept verbatim — no case folding, no ".git" stripping — so the
+// prefix always admits the very URL it was derived from. Exported for the
+// manifest Profiler, which records these prefixes instead of whole-host
+// grants; recording and matching share this one spelling.
+func GitHubProjectPrefix(u *url.URL) (string, bool) {
+	if u == nil || disguisesItsHost(u) {
+		return "", false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", false
+	}
+	host := canonicalHost(u)
+	p := path.Clean(u.Path)
+	segs := strings.Split(strings.TrimPrefix(p, "/"), "/")
+	if len(segs) > 0 && segs[0] == "" {
+		segs = nil
+	}
+	switch host {
+	case "github.com", "raw.githubusercontent.com", "codeload.github.com":
+		if len(segs) >= 2 {
+			return scheme + "://" + host + "/" + segs[0] + "/" + segs[1], true
+		}
+	case "api.github.com":
+		if len(segs) >= 3 && segs[0] == "repos" {
+			return scheme + "://api.github.com/repos/" + segs[1] + "/" + segs[2], true
+		}
+	}
+	return "", false
 }
 
 // DefaultPolicy is the policy NewConfig starts from: GET/HEAD only, the usual
@@ -213,7 +254,7 @@ func (p Policy) AllowsTarget(target string) bool {
 func (p Policy) Validate() error {
 	var bad []string
 	for _, pre := range p.AllowedPrefixes {
-		if _, ok := parseURLRule(pre); !ok {
+		if ValidateURLPrefix(pre) != nil {
 			bad = append(bad, strconv.Quote(pre))
 		}
 	}
@@ -241,6 +282,16 @@ type urlRule struct {
 	scheme string // lower-case, matched exactly
 	host   string // lower-case host[:port], a default port removed
 	path   string // cleaned path prefix; "" when the entry names the whole host
+}
+
+// ValidateURLPrefix vets one AllowedPrefixes entry. Exported for the
+// manifest package, which validates its urls list with the same rule the
+// enforce-time matcher applies.
+func ValidateURLPrefix(entry string) error {
+	if _, ok := parseURLRule(entry); !ok {
+		return fmt.Errorf("invalid entry %q; a URL prefix needs a scheme (e.g. https://host/path)", entry)
+	}
+	return nil
 }
 
 // parseURLRule parses one entry. ok is false when it is not a URL prefix.

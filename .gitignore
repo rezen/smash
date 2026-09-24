@@ -11,4 +11,5 @@
 /dist/
 
 *.manifest.yaml
+*.log
 .DS_Store

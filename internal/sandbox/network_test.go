@@ -279,6 +279,64 @@ func TestGitHubPrefixes(t *testing.T) {
 	}
 }
 
+// TestGitHubProjectPrefix: the classifier behind a profile manifest's urls
+// list — project-shaped GitHub URLs scope to owner/repo, everything else
+// (opaque asset hosts, short paths, disguised or off-family URLs) reports
+// false so the caller falls back to a host-level grant.
+func TestGitHubProjectPrefix(t *testing.T) {
+	for raw, want := range map[string]string{
+		"https://github.com/atuinsh/atuin/releases/latest/download/x": "https://github.com/atuinsh/atuin",
+		"https://github.com/o/r": "https://github.com/o/r",
+		"https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh":      "https://raw.githubusercontent.com/nvm-sh/nvm",
+		"https://codeload.github.com/o/r/tar.gz/refs/tags/v1":                  "https://codeload.github.com/o/r",
+		"https://api.github.com/repos/gruntwork-io/terragrunt/releases/latest": "https://api.github.com/repos/gruntwork-io/terragrunt",
+		"http://github.com/o/r":                   "http://github.com/o/r",      // scheme as observed
+		"https://github.com/Foo/Bar/releases":     "https://github.com/Foo/Bar", // verbatim case
+		"https://github.com/o/r.git":              "https://github.com/o/r.git", // .git kept: the prefix must admit the observed URL
+		"https://github.com/atuinsh":              "",                           // too short to name a project
+		"https://github.com/":                     "",
+		"https://api.github.com/rate_limit":       "", // api outside /repos
+		"https://api.github.com/repos/only-owner": "",
+		"https://objects.githubusercontent.com/github-production-release-asset-2e65be/id/uuid": "", // opaque
+		"https://release-assets.githubusercontent.com/github-production-release-asset/x":       "", // opaque
+		"https://gist.github.com/o/hash":      "",
+		"https://example.com/o/r":             "",
+		"ftp://github.com/o/r":                "",
+		"https://github.com:8443/o/r":         "", // non-default port
+		"https://github.com/o/../evil/r":      "", // traversal
+		"https://github.com@evil.example/o/r": "", // userinfo
+	} {
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatalf("parse %s: %v", raw, err)
+		}
+		got, ok := GitHubProjectPrefix(u)
+		if got != want || ok != (want != "") {
+			t.Errorf("GitHubProjectPrefix(%s) = %q/%v, want %q", raw, got, ok, want)
+		}
+	}
+	// Every produced prefix must admit the URL it came from — the replay
+	// guarantee behind keeping segments verbatim.
+	for _, raw := range []string{
+		"https://github.com/atuinsh/atuin/releases/latest/download/x",
+		"https://github.com/o/r.git",
+		"https://api.github.com/repos/gruntwork-io/terragrunt/releases/latest",
+	} {
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prefix, ok := GitHubProjectPrefix(u)
+		if !ok {
+			t.Fatalf("%s should classify", raw)
+		}
+		p := Policy{AllowedPrefixes: []string{prefix}}
+		if !p.Allows(u) {
+			t.Errorf("prefix %q does not admit its own source URL %s", prefix, raw)
+		}
+	}
+}
+
 // TestInterpreterEgress: allow-listing an interpreter grants the interpreter,
 // not the network. An offline one-liner runs; the one-line server and the
 // socket reverse shell are still held by the egress guard, and the denial
@@ -605,8 +663,8 @@ func TestDownloaderRecordsVia(t *testing.T) {
 			continue
 		}
 		seen = true
-		if !slices.Equal(r.Via, []string{"127.0.0.1"}) {
-			t.Errorf("Via = %v, want the (deduped) redirect chain", r.Via)
+		if !slices.Equal(r.Via, []string{srv.URL + "/redir", srv.URL + "/final"}) {
+			t.Errorf("Via = %v, want the full hop URLs", r.Via)
 		}
 		if r.ContentType != "text/plain" || r.Sniffed != "text/plain" {
 			t.Errorf("content types = %q/%q; observation must not require a MIME policy", r.ContentType, r.Sniffed)
@@ -616,17 +674,19 @@ func TestDownloaderRecordsVia(t *testing.T) {
 		t.Fatalf("no successful curl record in %d records", len(recs))
 	}
 
-	// Rendering: two hosts print a via line, one host prints nothing.
+	// Rendering: any actual redirect prints the full hop URLs — a same-host
+	// redirect (releases/latest → the tag URL) is still worth seeing — while
+	// a plain unredirected fetch prints nothing beyond its resources line.
 	var buf lockedBuffer
 	a := TextAuditor(&buf)
-	a.Audit(AuditRecord{Name: "curl", Via: []string{"a.example", "b.example"}, Duration: time.Millisecond})
-	a.Audit(AuditRecord{Name: "curl", Via: []string{"a.example"}, Duration: time.Millisecond})
+	a.Audit(AuditRecord{Name: "curl", Via: []string{"https://a.example/x", "https://b.example/y"}, Duration: time.Millisecond})
+	a.Audit(AuditRecord{Name: "curl", Via: []string{"https://a.example/only"}, Duration: time.Millisecond})
 	logText := buf.String()
-	if !strings.Contains(logText, "via: [a.example, b.example]") {
-		t.Errorf("two-host via line missing:\n%s", logText)
+	if !strings.Contains(logText, "via: [https://a.example/x, https://b.example/y]") {
+		t.Errorf("redirect via line missing the hop URLs:\n%s", logText)
 	}
 	if strings.Count(logText, "via:") != 1 {
-		t.Errorf("a single-host chain must not print via:\n%s", logText)
+		t.Errorf("an unredirected fetch must not print via:\n%s", logText)
 	}
 }
 

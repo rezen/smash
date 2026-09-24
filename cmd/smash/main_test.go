@@ -223,6 +223,15 @@ func TestProfileManifestAndEnforcedRun(t *testing.T) {
 	if len(m.Hosts) != 0 {
 		t.Errorf("profile hosts = %v", m.Hosts)
 	}
+	// The manifest's evidence — the full audit trail — lands beside it,
+	// regardless of where -audit pointed.
+	sidecar, err := os.ReadFile(filepath.Join(dir, "profile.log"))
+	if err != nil {
+		t.Fatalf("profile audit log missing next to the manifest: %v", err)
+	}
+	if !strings.Contains(string(sidecar), "- name: df") {
+		t.Errorf("profile audit log lacks the observed commands:\n%s", sidecar)
+	}
 
 	// The exact script is accepted. df is not on a deliberately empty policy
 	// allow-list, so success also proves the generated command grant is active.
@@ -312,6 +321,9 @@ func TestProfileBypassesDownloaderPolicyAndMocks(t *testing.T) {
 	}
 	if !slices.Equal(m.Commands, []string{"curl"}) || !slices.Equal(m.Hosts, []string{"127.0.0.1"}) {
 		t.Errorf("profile = commands %v, hosts %v", m.Commands, m.Hosts)
+	}
+	if m.URLs != nil {
+		t.Errorf("profile urls = %v, want none — 127.0.0.1 is not a project-shaped GitHub host", m.URLs)
 	}
 	if !slices.Equal(m.MIMETypes, []string{"application/gzip"}) {
 		t.Errorf("profile mime-types = %v, want the observed declared type", m.MIMETypes)

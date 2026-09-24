@@ -63,11 +63,15 @@ smash -manifest install.manifest.yaml fixtures/fly.sh --non-interactive
 ```
 
 The manifest records the profiling OS, binds the run to the script body's
-SHA-256, and contains sorted, de-duplicated `commands`, `hosts`, and
-`mime-types` lists — the hosts include redirect targets, and the media types
-are the ones the responses actually declared, because profiling runs `curl`
-and `wget` through the same in-process downloader an enforced run uses (in an
-observe-only configuration that admits everything). A
+SHA-256, and contains sorted, de-duplicated `commands`, `urls`, `hosts`, and
+`mime-types` lists — GitHub downloads are scoped in `urls` to the owner/repo
+actually observed (`https://github.com/example/tool`) rather than the whole
+forge, hosts include redirect targets (GitHub's opaque uuid/hash asset hosts
+stay host-level), and the media types are the ones the responses actually
+declared, because profiling runs `curl` and `wget` through the same
+in-process downloader an enforced run uses (in an observe-only configuration
+that admits everything). The run's full audit trail lands beside the manifest
+as `<name>.manifest.log`, so the evidence for each grant travels with it. A
 manifest run fails before execution if the OS or script changed, enables strict
 command gating, and replaces the run's command and network grants with those
 lists. Profile mode is otherwise
@@ -114,7 +118,7 @@ Useful command-line controls:
 | Flag | Purpose |
 |---|---|
 | `-policy FILE` | Read the complete run configuration from YAML |
-| `-profile` | Run and write a manifest with the script hash, commands, and hosts |
+| `-profile` | Run and write a manifest with the script hash, commands, GitHub owner/repo URL prefixes, and hosts |
 | `-profile-output FILE` | Choose the profile path instead of `<script>.manifest.yaml` |
 | `-manifest FILE` | Verify the script hash and enforce a reviewed profile |
 | `-urls PREFIXES` | Replace the URL prefixes available to `curl` and `wget` |

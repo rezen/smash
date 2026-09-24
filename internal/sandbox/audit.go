@@ -52,7 +52,7 @@ type AuditRecord struct {
 	Reason      string               // the sandbox's own diagnostic when IT failed the command (blocked, off-list URL…); "" if the program ran
 	ContentType string               // declared Content-Type of an in-process download's response, parameters stripped; "" when absent or the response had no body
 	Sniffed     string               // what the body's first bytes actually are (http.DetectContentType plus magic-byte refinement: tar, xz, executables, shebangs…); set whenever a download's response carried a body
-	Via         []string             // canonical host of every hop an in-process download passed through, initial request first
+	Via         []string             // full URL of every hop an in-process download passed through, initial request first; rendered only when a redirect occurred
 	Wrappers    []string             // the wrapper commands peeled off to reach this one, outermost first: sudo, env, timeout, xargs, find (see command.Unwrap)
 	Unlisted    bool                 // the program ran although it is on neither the allow-list nor inside the root (see DefaultAllowList)
 	InRoot      bool                 // the program ran through the in-sandbox escape hatch: it resolved inside Config.Root
@@ -92,6 +92,30 @@ type Auditor interface {
 type AuditorFunc func(rec AuditRecord)
 
 func (f AuditorFunc) Audit(rec AuditRecord) { f(rec) }
+
+// MultiAuditor fans every record out to all of auditors, the way
+// io.MultiWriter duplicates writes; shell-open records reach the ones that
+// implement OpenAuditor. Useful when one stream feeds a live view and
+// another a file kept beside a generated artifact. nil entries are skipped.
+func MultiAuditor(auditors ...Auditor) OpenAuditor { return multiAuditor(auditors) }
+
+type multiAuditor []Auditor
+
+func (m multiAuditor) Audit(rec AuditRecord) {
+	for _, a := range m {
+		if a != nil {
+			a.Audit(rec)
+		}
+	}
+}
+
+func (m multiAuditor) AuditOpen(rec OpenRecord) {
+	for _, a := range m {
+		if oa, ok := a.(OpenAuditor); ok {
+			oa.AuditOpen(rec)
+		}
+	}
+}
 
 // OpenRecord is one file the shell opened for itself — a redirection or a
 // `source` — as opposed to a file a command opened on its own behalf (those
@@ -285,7 +309,7 @@ func (t *textAuditor) Audit(r AuditRecord) {
 	if r.Sniffed != "" && r.Sniffed != r.ContentType {
 		rec.add("sniffed", t.scalar(r.Sniffed))
 	}
-	if len(r.Via) > 1 { // one host adds nothing beyond the request URL
+	if len(r.Via) > 1 { // more than one hop = a redirect actually happened
 		rec.add("via", t.list(r.Via))
 	}
 	if len(r.Wrappers) > 0 {
