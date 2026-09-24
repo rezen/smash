@@ -7,10 +7,23 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/rezen/smash/internal/network"
 )
+
+// TestDefaultPolicyDNS pins the default policy to the malware-blocking
+// resolver the network package names — losing it in a refactor would
+// silently fall back to whatever DNSServer's zero value means.
+func TestDefaultPolicyDNS(t *testing.T) {
+	if got := DefaultPolicy().DNSServer; got != network.DefaultDNSServer {
+		t.Errorf("default DNS server = %q, want %q", got, network.DefaultDNSServer)
+	}
+}
 
 func TestPolicyAllows(t *testing.T) {
 	p := DefaultPolicy()
@@ -102,6 +115,54 @@ func TestPolicyAllowedHosts(t *testing.T) {
 	p.AllowedHosts = []string{"downloads.example.test:443"}
 	if err := p.Validate(); err == nil {
 		t.Error("a manifest host with a port was accepted")
+	}
+}
+
+func TestPolicyAllowsMIME(t *testing.T) {
+	unrestricted := Policy{}
+	if !unrestricted.AllowsMIME("text/html") || !unrestricted.AllowsMIME("application/octet-stream") {
+		t.Error("a nil list must admit everything — an absent MIME policy is a no-op")
+	}
+	denyAll := Policy{AllowedMIMETypes: []string{}}
+	if denyAll.AllowsMIME("application/gzip") {
+		t.Error("an explicit empty list must deny everything")
+	}
+	p := Policy{AllowedMIMETypes: []string{"application/gzip", "text/*"}}
+	for mt, want := range map[string]bool{
+		"application/gzip":          true,
+		"Application/GZIP":          true, // case-insensitive
+		"text/plain":                true, // wildcard
+		"text/plain; charset=utf-8": true, // parameters stripped
+		"text/x-shellscript":        true,
+		"application/octet-stream":  false,
+		"application/gzip2":         false,
+		"image/png":                 false,
+		"":                          false, // unparseable fails closed
+	} {
+		if got := p.AllowsMIME(mt); got != want {
+			t.Errorf("AllowsMIME(%q) = %v, want %v", mt, got, want)
+		}
+	}
+}
+
+// TestPolicyValidateMIME: like a schemeless URL prefix, a malformed MIME entry
+// would fail closed silently; Validate names it instead.
+func TestPolicyValidateMIME(t *testing.T) {
+	good := DefaultPolicy()
+	good.AllowedMIMETypes = []string{"application/gzip", "TEXT/*", " text/plain "}
+	if err := good.Validate(); err != nil {
+		t.Errorf("valid entries should validate: %v", err)
+	}
+	for _, entry := range []string{"*/*", "*", "gzip", "text/plain; charset=utf-8", "text/*x", "*/gzip"} {
+		p := DefaultPolicy()
+		p.AllowedMIMETypes = []string{"application/gzip", entry}
+		err := p.Validate()
+		if err == nil || !strings.Contains(err.Error(), entry) {
+			t.Errorf("Validate should name the bad entry %q; got %v", entry, err)
+		}
+		if strings.Contains(err.Error(), "application/gzip\"") {
+			t.Errorf("Validate should not name the good entry; got %v", err)
+		}
 	}
 }
 
@@ -316,5 +377,282 @@ func TestMultipleURLsRefused(t *testing.T) {
 	// One URL plus a non-URL operand is still an ordinary fetch.
 	if out, er, err := runConfined(t, "curl -fsS "+srv.URL+"/a", allowLocal); err != nil || out != "body" {
 		t.Errorf("a single URL should work; out=%q stderr=%q err=%v", out, er, err)
+	}
+}
+
+// TestMIMEAllowList: with mime-types set, a response body must both declare an
+// allowed Content-Type and not sniff as something off-list. Absent policy,
+// HEAD requests and empty bodies are untouched.
+func TestMIMEAllowList(t *testing.T) {
+	tarball := tarballBytes(t, map[string]string{"bin/x": "#!/bin/sh\n"})
+	html := "<!DOCTYPE html><html><body>maintenance</body></html>"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/tool.tgz":
+			w.Header().Set("Content-Type", "application/gzip")
+			w.Write(tarball)
+		case "/install.sh":
+			w.Header().Set("Content-Type", "text/x-shellscript")
+			io.WriteString(w, "#!/bin/sh\necho hi\n")
+		case "/page":
+			w.Header().Set("Content-Type", "text/html")
+			io.WriteString(w, html)
+		case "/mislabeled":
+			w.Header().Set("Content-Type", "application/gzip")
+			io.WriteString(w, html)
+		case "/no-type":
+			w.Header()["Content-Type"] = nil // suppress Go's auto-detection
+			io.WriteString(w, "hello")
+		case "/params":
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			io.WriteString(w, "plain")
+		case "/empty":
+			w.Header()["Content-Type"] = nil
+		}
+	}))
+	defer srv.Close()
+	mimePolicy := func(types ...string) option {
+		if types == nil {
+			types = []string{} // mimePolicy() is the explicit deny-all list, not "unset"
+		}
+		return func(c *Config) {
+			c.Network.AllowedPrefixes = []string{srv.URL}
+			c.Network.AllowedMIMETypes = types
+		}
+	}
+
+	if _, er, err := runConfined(t, "curl -fsS "+srv.URL+"/tool.tgz -o t.tgz", withHome(t), mimePolicy("application/gzip")); err != nil {
+		t.Errorf("an allowed archive should download (gzip sniffs as application/x-gzip); stderr=%q err=%v", er, err)
+	}
+	if out, er, err := runConfined(t, "curl -fsS "+srv.URL+"/install.sh", mimePolicy("text/*")); err != nil || !strings.Contains(out, "echo hi") {
+		t.Errorf("a text/* wildcard should admit a shell script; out=%q stderr=%q err=%v", out, er, err)
+	}
+	if out, er, err := runConfined(t, "curl -fsS "+srv.URL+"/params", mimePolicy("text/plain")); err != nil || out != "plain" {
+		t.Errorf("Content-Type parameters should be ignored; out=%q stderr=%q err=%v", out, er, err)
+	}
+	if _, er, err := runConfined(t, "curl -fsS "+srv.URL+"/page", mimePolicy("application/gzip")); err == nil ||
+		!strings.Contains(er, `[sandbox] response Content-Type "text/html" not in mime-types allow-list`) {
+		t.Errorf("an off-list declared type should be refused; stderr=%q err=%v", er, err)
+	}
+	if _, er, err := runConfined(t, "curl -fsS "+srv.URL+"/mislabeled -o t.tgz", withHome(t), mimePolicy("application/gzip")); err == nil ||
+		!strings.Contains(er, `sniffs as "text/html"`) || !strings.Contains(er, `declared "application/gzip"`) {
+		t.Errorf("a body contradicting its declared type should be refused, naming both; stderr=%q err=%v", er, err)
+	}
+	if _, er, err := runConfined(t, "curl -fsS "+srv.URL+"/no-type", mimePolicy("text/plain")); err == nil ||
+		!strings.Contains(er, "no Content-Type") {
+		t.Errorf("a missing Content-Type should be refused while the list is set; stderr=%q err=%v", er, err)
+	}
+	if _, er, err := runConfined(t, "curl -fsS "+srv.URL+"/install.sh", mimePolicy()); err == nil ||
+		!strings.Contains(er, "not in mime-types allow-list") {
+		t.Errorf("mime-types [] should deny every body; stderr=%q err=%v", er, err)
+	}
+	// The exemptions: HEAD delivers no body; an empty body delivers nothing;
+	// and without a list the gate does not exist at all.
+	if _, er, err := runConfined(t, "curl -sfI "+srv.URL+"/page", mimePolicy("application/gzip")); err != nil {
+		t.Errorf("HEAD has no body to gate; stderr=%q err=%v", er, err)
+	}
+	if _, er, err := runConfined(t, "curl -fsS "+srv.URL+"/empty", mimePolicy("application/gzip")); err != nil {
+		t.Errorf("an empty body has nothing to gate; stderr=%q err=%v", er, err)
+	}
+	if out, er, err := runConfined(t, "curl -fsS "+srv.URL+"/page",
+		func(c *Config) { c.Network.AllowedPrefixes = []string{srv.URL} }); err != nil || out != html {
+		t.Errorf("absent mime-types must stay a no-op; out=%q stderr=%q err=%v", out, er, err)
+	}
+
+	// The audit trail carries both types — on success and, with the denial's
+	// reason, on refusal.
+	var recs []AuditRecord
+	_, _, err := runConfined(t, "curl -fsS "+srv.URL+"/tool.tgz -o t.tgz && curl -fsS "+srv.URL+"/mislabeled",
+		withHome(t), mimePolicy("application/gzip"), collectAudit(&recs))
+	if err == nil {
+		t.Fatal("the mislabeled fetch should have failed the run")
+	}
+	var ok, denied bool
+	for _, r := range recs {
+		if r.Name != "curl" {
+			continue
+		}
+		switch {
+		case r.Exit == nil:
+			ok = r.ContentType == "application/gzip" && r.Sniffed == "application/x-gzip"
+			if !ok {
+				t.Errorf("allowed fetch audited as content-type=%q sniffed=%q", r.ContentType, r.Sniffed)
+			}
+		default:
+			denied = r.ContentType == "application/gzip" && r.Sniffed == "text/html" &&
+				strings.Contains(r.Reason, `sniffs as "text/html"`)
+			if !denied {
+				t.Errorf("denied fetch audited as content-type=%q sniffed=%q reason=%q", r.ContentType, r.Sniffed, r.Reason)
+			}
+		}
+	}
+	if !ok || !denied {
+		t.Errorf("expected one allowed and one denied curl record; got %d records", len(recs))
+	}
+}
+
+// TestDownloaderVersionAndHelp: probes must answer in-process — installers
+// branch on them (vector.sh sniffs `wget -V` for BusyBox) — and must not
+// fail "no URL specified" or trip the URL allow-list.
+func TestDownloaderVersionAndHelp(t *testing.T) {
+	for _, script := range []string{"curl --version", "curl --help", "wget -V", "wget --help"} {
+		out, er, err := runConfined(t, script)
+		if err != nil || out == "" {
+			t.Errorf("%q: out=%q stderr=%q err=%v", script, out, er, err)
+		}
+		if strings.Contains(er, "no URL specified") || strings.Contains(er, "not in allow-list") {
+			t.Errorf("%q: a probe hit the fetch path: stderr=%q", script, er)
+		}
+	}
+	// vector.sh's BusyBox sniff: first word of line 2 (or line 1 of shorter
+	// output) of `wget -V`.
+	out, _, err := runConfined(t, `wget -V 2>&1 | head -2 | tail -1 | cut -f1 -d" "`)
+	if err != nil || strings.TrimSpace(out) == "BusyBox" || strings.TrimSpace(out) == "" {
+		t.Errorf("wget -V sniff = %q, err=%v; must not read as BusyBox", out, err)
+	}
+}
+
+// TestWgetDefaultFilename: real wget derives the output filename from the
+// URL when -O is absent; -O - still streams to stdout.
+func TestWgetDefaultFilename(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("payload:" + r.URL.Path))
+	}))
+	defer srv.Close()
+	local := func(c *Config) { c.Network.AllowedPrefixes = []string{srv.URL} }
+
+	out, er, err := runConfined(t, "wget -q "+srv.URL+"/dl/tool.tgz && cat tool.tgz", withHome(t), local)
+	if err != nil || out != "payload:/dl/tool.tgz" {
+		t.Errorf("bare wget should create tool.tgz; out=%q stderr=%q err=%v", out, er, err)
+	}
+	out, er, err = runConfined(t, "wget -q "+srv.URL+"/dir/ && cat index.html", withHome(t), local)
+	if err != nil || out != "payload:/dir/" {
+		t.Errorf("a bare-directory URL should write index.html; out=%q stderr=%q err=%v", out, er, err)
+	}
+	out, er, err = runConfined(t, "wget -q -O - "+srv.URL+"/x", local)
+	if err != nil || out != "payload:/x" {
+		t.Errorf("wget -O - must stream to stdout; out=%q stderr=%q err=%v", out, er, err)
+	}
+}
+
+// TestSniffRefinesOctetStream: a server that only says octet-stream tells
+// the reviewer nothing — the audit's sniffed type names what the asset
+// actually is (magic bytes), and the refinement never costs a download that
+// an octet-stream allow-list admitted.
+func TestSniffRefinesOctetStream(t *testing.T) {
+	tarHead := make([]byte, 600)
+	copy(tarHead[257:], "ustar")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		switch r.URL.Path {
+		case "/asset.tar":
+			w.Write(tarHead)
+		case "/tool":
+			w.Write([]byte{0x7F, 'E', 'L', 'F', 2, 1, 1, 0})
+		}
+	}))
+	defer srv.Close()
+	local := func(c *Config) { c.Network.AllowedPrefixes = []string{srv.URL} }
+
+	var recs []AuditRecord
+	_, er, err := runConfined(t, "curl -fsS "+srv.URL+"/asset.tar -o a.tar && curl -fsS "+srv.URL+"/tool -o tool",
+		withHome(t), local, collectAudit(&recs),
+		func(c *Config) { c.Network.AllowedMIMETypes = []string{"application/octet-stream"} })
+	if err != nil {
+		t.Fatalf("refined sniffs must not fail an octet-stream allow-list; stderr=%q err=%v", er, err)
+	}
+	want := map[string]bool{"application/x-tar": false, "application/x-executable": false}
+	for _, r := range recs {
+		if r.Name == "curl" && r.Exit == nil {
+			if _, ok := want[r.Sniffed]; !ok {
+				t.Errorf("sniffed = %q (declared %q), want a refined file type", r.Sniffed, r.ContentType)
+				continue
+			}
+			want[r.Sniffed] = true
+		}
+	}
+	for typ, seen := range want {
+		if !seen {
+			t.Errorf("no audit record sniffed as %s", typ)
+		}
+	}
+}
+
+// TestDownloaderRecordsVia: the audit carries the response's media types for
+// every download (no MIME policy required) and the hosts a redirect chain
+// passed through; the text log prints via only when it adds information.
+func TestDownloaderRecordsVia(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/redir":
+			http.Redirect(w, r, "/final", http.StatusFound)
+		default:
+			w.Header().Set("Content-Type", "text/plain")
+			w.Write([]byte("FINAL"))
+		}
+	}))
+	defer srv.Close()
+
+	var recs []AuditRecord
+	_, er, err := runConfined(t, "curl -sL "+srv.URL+"/redir",
+		func(c *Config) { c.Network.AllowedPrefixes = []string{srv.URL} }, collectAudit(&recs))
+	if err != nil {
+		t.Fatalf("stderr=%q err=%v", er, err)
+	}
+	var seen bool
+	for _, r := range recs {
+		if r.Name != "curl" || r.Exit != nil {
+			continue
+		}
+		seen = true
+		if !slices.Equal(r.Via, []string{"127.0.0.1"}) {
+			t.Errorf("Via = %v, want the (deduped) redirect chain", r.Via)
+		}
+		if r.ContentType != "text/plain" || r.Sniffed != "text/plain" {
+			t.Errorf("content types = %q/%q; observation must not require a MIME policy", r.ContentType, r.Sniffed)
+		}
+	}
+	if !seen {
+		t.Fatalf("no successful curl record in %d records", len(recs))
+	}
+
+	// Rendering: two hosts print a via line, one host prints nothing.
+	var buf lockedBuffer
+	a := TextAuditor(&buf)
+	a.Audit(AuditRecord{Name: "curl", Via: []string{"a.example", "b.example"}, Duration: time.Millisecond})
+	a.Audit(AuditRecord{Name: "curl", Via: []string{"a.example"}, Duration: time.Millisecond})
+	logText := buf.String()
+	if !strings.Contains(logText, "via: [a.example, b.example]") {
+		t.Errorf("two-host via line missing:\n%s", logText)
+	}
+	if strings.Count(logText, "via:") != 1 {
+		t.Errorf("a single-host chain must not print via:\n%s", logText)
+	}
+}
+
+// TestProfileModeDownloadsInProcess: profile mode serves curl through the
+// same in-process downloader under the observe config — the policy under
+// construction (broken resolver, empty allow-list, closed methods) must not
+// interfere, while smash's own write confinement still holds.
+func TestProfileModeDownloadsInProcess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(r.Method + " ok"))
+	}))
+	defer srv.Close()
+	profiled := func(c *Config) {
+		c.Profile = true
+		c.Network.DNSServer = "not-an-ip" // must not break the observe transport
+	}
+
+	if out, er, err := runConfined(t, "curl -fsS "+srv.URL+"/x", profiled); err != nil || out != "GET ok" {
+		t.Errorf("profile fetch failed under a hostile policy; out=%q stderr=%q err=%v", out, er, err)
+	}
+	if out, er, err := runConfined(t, "curl -fsS -X DELETE "+srv.URL+"/x", profiled); err != nil || out != "DELETE ok" {
+		t.Errorf("observe mode must admit every method; out=%q stderr=%q err=%v", out, er, err)
+	}
+	outside := t.TempDir() + "/stolen.bin"
+	if _, er, err := runConfined(t, "curl -fsS "+srv.URL+"/x -o "+strconv.Quote(outside), profiled); err == nil ||
+		!strings.Contains(er, "refusing to write outside") {
+		t.Errorf("observe mode must keep smash's own writes in root; stderr=%q err=%v", er, err)
 	}
 }

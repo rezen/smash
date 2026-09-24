@@ -124,6 +124,16 @@ network:
   # HTTP methods a downloader may use. Setting this replaces the default.
   #methods: [GET, HEAD]
 
+  # Response-body MIME allow-list for in-process curl/wget. The declared
+  # Content-Type must match an entry (parameters ignored; type/* wildcards
+  # work) and the body's first bytes must not sniff as a disallowed type.
+  # Unset, any type is allowed; an explicit empty list ([]) denies every
+  # response body, like 'urls: []'.
+  #mime-types:
+  #  - application/gzip
+  #  - application/octet-stream
+  #  - text/*
+
   # Response body cap. A plain number is bytes; a suffix works too
   # ("200MiB", "1GB" — binary units are powers of 1024, decimal ones of 1000).
   #max-response: 200MiB

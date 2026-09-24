@@ -4,6 +4,7 @@
 package tool
 
 import (
+	"context"
 	"fmt"
 	"io"
 
@@ -37,4 +38,30 @@ func Failf(w io.Writer, code int, format string, args ...any) error {
 	msg := fmt.Sprintf(format, args...)
 	fmt.Fprintln(w, msg)
 	return &Failure{Code: code, Msg: msg}
+}
+
+// ResponseNote carries what a downloader's response looked like out to the
+// sandbox's audit layer, the way the command gate's note carries its
+// verdicts. The auditor attaches one to the context; runDownloader fills it
+// in for any response — the media-type fields whenever a body came back,
+// whether or not a MIME gate is enforcing.
+type ResponseNote struct {
+	ContentType string   // declared Content-Type, parameters stripped; "" when absent or unparseable
+	Sniffed     string   // what the first body bytes are: http.DetectContentType sharpened by refineSniff (tar/xz/executables/shebangs…)
+	Via         []string // canonical host of every response hop, initial request first, deduped
+}
+
+type responseNoteKey struct{}
+
+// WithResponseNote attaches a fresh note to ctx and returns it for reading
+// after the command completes.
+func WithResponseNote(ctx context.Context) (context.Context, *ResponseNote) {
+	n := &ResponseNote{}
+	return context.WithValue(ctx, responseNoteKey{}, n), n
+}
+
+// ResponseNoteFrom returns the note attached to ctx, or nil.
+func ResponseNoteFrom(ctx context.Context) *ResponseNote {
+	n, _ := ctx.Value(responseNoteKey{}).(*ResponseNote)
+	return n
 }

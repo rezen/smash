@@ -68,14 +68,16 @@ func TestExecLayerOrdering(t *testing.T) {
 }
 
 // TestProfileModeLayers pins profile mode's carve-out: it observes without
-// enforcing, so exactly the observation layers remain.
+// enforcing, so the observation layers remain — including http, which under
+// profile is the observe-only downloader (everything admitted), so discovery
+// exercises the same in-process implementation enforcement will use.
 func TestProfileModeLayers(t *testing.T) {
 	cfg := everythingOnConfig(t)
 	cfg.Profile = true
 	names := layerNames(t, cfg)
 	want := []string{
 		"unwrap", "audit", "sudo-grant",
-		"sh-interp", "tool-mktemp", "tool-sha256sum", "tool-base64", "uname", "tty",
+		"sh-interp", "tool-mktemp", "tool-sha256sum", "tool-base64", "uname", "http", "tty",
 	}
 	if !slices.Equal(names, want) {
 		t.Fatalf("profile-mode stack changed:\n got  %v\n want %v", names, want)

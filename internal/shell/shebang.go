@@ -1,9 +1,4 @@
-// Package shebang parses `#!` lines. The sandbox needs one answer shared by
-// everything that asks: the POSIX-mode check on a script's source (IsSh) and
-// the interpreter check on an in-root file the command gate is about to
-// judge (FromFile) must agree on what a shebang names, env indirection
-// included.
-package shebang
+package shell
 
 import (
 	"io"
@@ -44,10 +39,10 @@ func IsSh(src string) bool {
 	return ok && filepath.Base(interp) == "sh"
 }
 
-// FromFile returns the interpreter a file's `#!` line names. ok is false for
-// a binary, an unreadable file, or a script with no shebang (which the
-// kernel refuses and the shell would run itself).
-func FromFile(path string) (string, bool) {
+// InterpreterFromFile returns the interpreter a file's `#!` line names. ok
+// is false for a binary, an unreadable file, or a script with no shebang
+// (which the kernel refuses and the shell would run itself).
+func InterpreterFromFile(path string) (string, bool) {
 	if path == "" {
 		return "", false
 	}

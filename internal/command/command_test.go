@@ -270,6 +270,10 @@ func TestRequest(t *testing.T) {
 		t.Errorf("curl -I not parsed: %+v", head)
 	}
 
+	if flagged := req("curl", "--url", "https://x/y"); flagged.URL != "https://x/y" {
+		t.Errorf("curl --url is the flag spelling of the operand: %+v", flagged)
+	}
+
 	wget := req("wget", "--header", "X-A: 1", "https://github.com/astral-sh/uv", "-O", "uv.tgz")
 	if wget.URL != "https://github.com/astral-sh/uv" || wget.Output != "uv.tgz" {
 		t.Fatalf("wget url/out wrong: %+v", wget)
@@ -277,8 +281,40 @@ func TestRequest(t *testing.T) {
 	if !wget.Follow || wget.Headers.Get("X-A") != "1" { // wget follows redirects by default
 		t.Fatalf("wget defaults/headers wrong: %+v", wget)
 	}
+	if wget.RemoteName {
+		t.Errorf("wget -O must not derive the filename from the URL: %+v", wget)
+	}
 	if lg := req("wget", "-o", "log.txt", "-U", "ua", "https://x"); lg.Output != "" || lg.Headers.Get("User-Agent") != "ua" {
 		t.Errorf("wget -o is a logfile, not the output: %+v", lg)
+	}
+	// Real-wget defaults: no -O derives the filename from the URL; -O - is stdout.
+	if bare := req("wget", "https://x/tool.tgz"); !bare.RemoteName {
+		t.Errorf("bare wget must write the URL-derived filename: %+v", bare)
+	}
+	if dash := req("wget", "-O", "-", "https://x/y"); dash.Output != "-" || dash.RemoteName {
+		t.Errorf("wget -O - is stdout: %+v", dash)
+	}
+}
+
+// TestDownloaderValueFlags: a space-separated value flag the spec does not
+// know keeps its value, which lands in Operands and can be mistaken for the
+// URL. The unmodelled-but-consumed lists must cover the flags installers use.
+func TestDownloaderValueFlags(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		url  string
+	}{
+		{[]string{"curl", "-x", "http://proxy:8080", "https://x/y"}, "https://x/y"},
+		{[]string{"curl", "--cacert", "ca.pem", "https://x/y"}, "https://x/y"},
+		{[]string{"curl", "-m", "10", "--max-redirs", "3", "https://x/y"}, "https://x/y"},
+		{[]string{"curl", "-F", "f=@file", "--output-dir", "d", "https://x/y"}, "https://x/y"},
+		{[]string{"wget", "--ciphers", "HIGH", "--user", "bob", "https://x/y"}, "https://x/y"},
+		{[]string{"wget", "--ca-certificate", "ca.pem", "https://x/y"}, "https://x/y"},
+	} {
+		p := Parse(tc.args)
+		if len(p.Operands) != 1 || p.Operands[0] != tc.url {
+			t.Errorf("Parse(%v).Operands = %v, want exactly [%s]", tc.args, p.Operands, tc.url)
+		}
 	}
 }
 

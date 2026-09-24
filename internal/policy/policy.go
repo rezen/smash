@@ -72,6 +72,7 @@ type Network struct {
 	GitHub      bool              `yaml:"github"`       // also append sandbox.GitHubPrefixes
 	GitHosts    Strings           `yaml:"git-hosts"`    // replaces the default forges when present
 	Methods     Strings           `yaml:"methods"`      // replaces the default GET/HEAD when present
+	MIMETypes   Strings           `yaml:"mime-types"`   // response-body MIME allow-list; null = unrestricted, [] = deny all bodies
 	MaxResponse *Size             `yaml:"max-response"` // bytes, or a size like "200MiB"
 	MaxRequest  *Size             `yaml:"max-request"`  // request-body bytes, or a size like "8MiB"
 	Timeout     *Duration         `yaml:"timeout"`
@@ -201,6 +202,9 @@ func (f *File) Apply(cfg *sandbox.Config) error {
 			for _, m := range n.Methods {
 				cfg.Network.AllowedMethods[strings.ToUpper(m)] = true
 			}
+		}
+		if n.MIMETypes != nil {
+			cfg.Network.AllowedMIMETypes = n.MIMETypes
 		}
 		if n.MaxResponse != nil {
 			cfg.Network.MaxResponse = int64(*n.MaxResponse)

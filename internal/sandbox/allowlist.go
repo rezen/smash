@@ -27,7 +27,7 @@ import (
 
 	"github.com/rezen/smash/internal/command"
 	"github.com/rezen/smash/internal/pathsafe"
-	"github.com/rezen/smash/internal/shebang"
+	"github.com/rezen/smash/internal/shell"
 )
 
 // DefaultAllowList is a list of commands that installer
@@ -201,7 +201,7 @@ func allowListMiddleware(g gate) Middleware {
 // invoked directly, and a real binary, which needs the explicit
 // AllowInRootExecutables capability and is flagged InRoot.
 func (g gate) runFromRoot(ctx context.Context, execute interp.ExecHandlerFunc, hc interp.HandlerContext, path string, args []string) error {
-	via, hasShebang := shebang.FromFile(path)
+	via, hasShebang := shell.InterpreterFromFile(path)
 	name := filepath.Base(via)
 	if hasShebang {
 		// Denial comes first and is absolute, as it is everywhere else: an

@@ -38,23 +38,27 @@ import (
 	"mvdan.cc/sh/v3/interp"
 
 	"github.com/rezen/smash/internal/command"
+	"github.com/rezen/smash/internal/tool"
 )
 
 // AuditRecord is everything the sandbox knows about one executed command.
 type AuditRecord struct {
-	Name      string               // command name (after wrapper unwrapping)
-	Command   string               // normalized command line, e.g. "base64 -d" (secrets redacted)
-	Params    command.Params       // typed params (Base64Params, CurlParams, …) or the generic ParsedCommand, redacted
-	Resources []command.Resource   // what it touched: "read stdin", "fetch url …"
-	Files     []command.FileChange // filesystem changes, for monitoring: "delete /x (recursive)"
-	Exit      error                // nil on success; interp.ExitStatus(n) otherwise
-	Reason    string               // the sandbox's own diagnostic when IT failed the command (blocked, off-list URL…); "" if the program ran
-	Wrappers  []string             // the wrapper commands peeled off to reach this one, outermost first: sudo, env, timeout, xargs, find (see command.Unwrap)
-	Unlisted  bool                 // the program ran although it is on neither the allow-list nor inside the root (see DefaultAllowList)
-	InRoot    bool                 // the program ran through the in-sandbox escape hatch: it resolved inside Config.Root
-	Duration  time.Duration
-	Stdin     Capture // data read from stdin (only when AuditData > 0)
-	Stdout    Capture // data written to stdout
+	Name        string               // command name (after wrapper unwrapping)
+	Command     string               // normalized command line, e.g. "base64 -d" (secrets redacted)
+	Params      command.Params       // typed params (Base64Params, CurlParams, …) or the generic ParsedCommand, redacted
+	Resources   []command.Resource   // what it touched: "read stdin", "fetch url …"
+	Files       []command.FileChange // filesystem changes, for monitoring: "delete /x (recursive)"
+	Exit        error                // nil on success; interp.ExitStatus(n) otherwise
+	Reason      string               // the sandbox's own diagnostic when IT failed the command (blocked, off-list URL…); "" if the program ran
+	ContentType string               // declared Content-Type of an in-process download's response, parameters stripped; "" when absent or the response had no body
+	Sniffed     string               // what the body's first bytes actually are (http.DetectContentType plus magic-byte refinement: tar, xz, executables, shebangs…); set whenever a download's response carried a body
+	Via         []string             // canonical host of every hop an in-process download passed through, initial request first
+	Wrappers    []string             // the wrapper commands peeled off to reach this one, outermost first: sudo, env, timeout, xargs, find (see command.Unwrap)
+	Unlisted    bool                 // the program ran although it is on neither the allow-list nor inside the root (see DefaultAllowList)
+	InRoot      bool                 // the program ran through the in-sandbox escape hatch: it resolved inside Config.Root
+	Duration    time.Duration
+	Stdin       Capture // data read from stdin (only when AuditData > 0)
+	Stdout      Capture // data written to stdout
 }
 
 // Capture is a bounded copy of a stream: the first Cap bytes plus the total.
@@ -161,6 +165,7 @@ type OpenAuditor interface {
 //	  params: !CurlParams {Silent: true, ShowError: true, FailFast: true, Follow: true, URL: https://x/uv.tgz, Output: ~/uv.tgz}
 //	  files: [delete ~/.cache (recursive)]   # only changes resources doesn't already say
 //	  exit: 0
+//	  content-type: application/gzip         # declared by the response; sniffed/via appear when they add information
 //	  duration: 120ms
 //	  stdin: {bytes: 8, data: "aGVsbG8="}
 //	  stdout: {bytes: 5, data: "hello"}
@@ -273,6 +278,15 @@ func (t *textAuditor) Audit(r AuditRecord) {
 	}
 	if r.Reason != "" {
 		rec.add("reason", t.scalar(r.Reason))
+	}
+	if r.ContentType != "" {
+		rec.add("content-type", t.scalar(r.ContentType))
+	}
+	if r.Sniffed != "" && r.Sniffed != r.ContentType {
+		rec.add("sniffed", t.scalar(r.Sniffed))
+	}
+	if len(r.Via) > 1 { // one host adds nothing beyond the request URL
+		rec.add("via", t.list(r.Via))
 	}
 	if len(r.Wrappers) > 0 {
 		rec.add("wrappers", t.list(r.Wrappers))
@@ -524,7 +538,8 @@ func auditMiddleware(a Auditor, dataCap int) Middleware {
 				hc.Stdout = io.MultiWriter(hc.Stdout, &out)
 				ctx = interp.WithHandlerContext(ctx, hc)
 			}
-			ctx, note := withGateNote(ctx) // filled in by the command gate
+			ctx, note := withGateNote(ctx)              // filled in by the command gate
+			ctx, respNote := tool.WithResponseNote(ctx) // filled in by the in-process downloader
 			start := time.Now()
 			err := next(ctx, args)
 			params := command.Redact(p.TypedParams()) // never log credentials
@@ -533,19 +548,22 @@ func auditMiddleware(a Auditor, dataCap int) Middleware {
 				reason = f.Msg
 			}
 			a.Audit(AuditRecord{
-				Name:      p.Name,
-				Command:   params.String(),
-				Params:    params,
-				Resources: p.Resources(),
-				Files:     p.FileChanges(),
-				Exit:      err,
-				Reason:    reason,
-				Wrappers:  wrappersFrom(ctx),
-				Unlisted:  note.Unlisted,
-				InRoot:    note.InRoot,
-				Duration:  time.Since(start),
-				Stdin:     in.capture(),
-				Stdout:    out.capture(),
+				Name:        p.Name,
+				Command:     params.String(),
+				Params:      params,
+				Resources:   p.Resources(),
+				Files:       p.FileChanges(),
+				Exit:        err,
+				Reason:      reason,
+				ContentType: respNote.ContentType,
+				Sniffed:     respNote.Sniffed,
+				Via:         respNote.Via,
+				Wrappers:    wrappersFrom(ctx),
+				Unlisted:    note.Unlisted,
+				InRoot:      note.InRoot,
+				Duration:    time.Since(start),
+				Stdin:       in.capture(),
+				Stdout:      out.capture(),
 			})
 			return err
 		}

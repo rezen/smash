@@ -107,6 +107,8 @@ executed by a configurable Go `http.Client`, allowing `smash` to enforce:
 - an HTTP method allow-list;
 - a request-body limit and root-confined `@file` inputs;
 - a response-body limit;
+- an optional response MIME-type allow-list, checked against both the declared
+  `Content-Type` and a 512-byte content sniff of the body;
 - per-request timeouts;
 - injected headers;
 - proxy and TLS behavior supplied by the configured transport;
@@ -129,6 +131,19 @@ does not exist.
 The output path of in-process `curl -o` or `wget -O` must remain inside the run
 root. This is a real filesystem guarantee because `smash` itself performs that
 write.
+
+When a policy sets `network.mime-types`, a response body is delivered only if
+its declared `Content-Type` matches the list and its first bytes do not sniff
+as a disallowed type — which catches an HTML error or portal page served under
+an archive's name. The sniff is `http.DetectContentType` sharpened by a
+magic-number table (tar, xz, zstd, bzip2, 7z, deb/rpm/xar packages, ELF,
+Mach-O and PE executables, and shebanged scripts by interpreter), so the
+audit names what an `application/octet-stream` download actually was. The
+refinement is observability, not policy: a detected binary type passes the
+gate wherever plain octet-stream did, so this still gates labels, not
+content — checksum verification remains the integrity check. HEAD requests
+and empty bodies deliver no content and are exempt. The declared and sniffed
+types are recorded in the audit trail either way.
 
 The DNS default adds a reputation-based block before connection, but it is not
 a hard security boundary: ordinary DNS is unencrypted, an HTTP proxy may
@@ -204,16 +219,25 @@ log destination accordingly.
 A profile manifest associates an observed command/host set with the profiling
 OS and binds it to the SHA-256 of the script bytes. Enforcing it rejects a
 different OS or changed script and turns the observed commands and exact hosts
-into strict grants. The hash does not establish who
+into strict grants. A `mime-types` list additionally applies the response MIME
+gate described under the download policy; the profiler records the declared
+types it observed (and omits the list whenever a download body arrived without
+a parseable `Content-Type`, since enforcement would then deny the profiled
+script itself). The hash does not establish who
 authored the script, and a profile is not a static proof of all possible
 behavior: different arguments, environment, platform, network responses, or
 timing may select branches that were not exercised.
 
 Profiling is intentionally non-enforcing so discovery is not truncated by a
-Smash policy decision. Command denials, strict mode, mocks, in-process download
-controls, egress controls, the sleep cap, in-root native executable checks, and
-the raw-socket guard are bypassed while audit collection remains active. This
-means sensitive commands and real network clients can run. Profile only trusted
+Smash policy decision. Command denials, strict mode, mocks, downloader
+allow-lists, egress controls, the sleep cap, in-root native executable checks,
+and the raw-socket guard are bypassed while audit collection remains active.
+`curl` and `wget` still run through the shared in-process downloader — in an
+observe-only configuration that admits every URL, method, and media type,
+pins the transport to the default resolver and caps, and keeps output
+confined to the root — so discovery exercises the implementation a manifest
+is later enforced against, and redirect hops and response media types are
+recorded. Every other network-capable command runs as a real host process. Profile only trusted
 scripts or add an OS-level sandbox/container, review manifests before
 enforcement, and profile every execution variant that matters. Non-zero exits
 remain visible to the audit, conditionals, and AND/OR lists, but the interpreter

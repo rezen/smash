@@ -62,13 +62,26 @@ internal/sandbox/   the enforcement stack on mvdan/sh
   vars.go       RunVars (resolved variable table) + Assignments (static AST walk)
   *_test.go     egress, unwrap, redirects, rvm/get-docker containment
 
-internal/hostname/  one spelling of "extract the host from a target string"
-  hostname.go   FromEndpoint (shared by the Profiler and Policy.AllowsTarget so
-                recording and enforcement cannot drift), FromGitRemote, Valid
+internal/network/   network mechanics shared by profile and enforce (no policy)
+  network.go    package charter: recording and enforcement must parse alike
+  dns.go        DefaultDNSServer (Quad9) + NewHTTPClient — the DNS-pinned
+                client the script fetch and in-process curl/wget ride
+  host.go       HostFromEndpoint (shared by the Profiler and Policy.AllowsTarget
+                so recording and enforcement cannot drift), HostFromGitRemote,
+                ValidHost
+  devnet.go     ParseDevNet — bash's /dev/tcp + /dev/udp pseudo-device paths
 
-internal/shebang/   `#!` line parsing, env indirection included
-  shebang.go    Interpreter, IsSh (POSIX-mode check), FromFile (the gate's
-                in-root interpreter check)
+internal/shell/     mechanics of hosting a shell script (no policy)
+  shebang.go    Interpreter, IsSh (POSIX-mode check), InterpreterFromFile (the
+                gate's in-root interpreter check); env indirection included
+  tty.go        SameOpenFile — picks a pipeline's terminal-facing member
+  tty_unix.go   RestoreTTY — reopen the PTY into its original descriptor
+
+internal/gitconfig/ on-disk git state, read without running git
+  gitconfig.go  FindGitDir (the nearest-.git walk git does) + RemoteURLs
+                ([remote "name"] url/pushurl, `gitdir:` pointer files
+                followed) — how the egress guard resolves a remote name to
+                the place it reaches
 
 internal/pathsafe/  "is this path inside that directory?" for untrusted paths
   pathsafe.go   Within (symlink-resolving; nonexistent targets judged by their

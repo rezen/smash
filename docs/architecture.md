@@ -170,9 +170,17 @@ detected in the interpreter's file-open path because they never become external
 commands.
 
 `curl` and `wget` additionally implement `Downloader`. Their request objects are
-executed by `internal/tool`, using the policy-configured HTTP client to
-recheck redirects, bound request and response bodies, and confine
-runner-controlled input and output files.
+executed by `internal/tool` in both modes — under the policy-configured HTTP
+client when enforcing, and under an observe-only configuration in profile
+mode — rechecking redirects, bounding request and response bodies, and
+confining runner-controlled input and output files. Every response with a
+body is observed: its declared `Content-Type` and the detected type of its
+first bytes (`http.DetectContentType` sharpened by a magic-number table, so
+an octet-stream download reads as the tar/xz/executable/script it is) appear
+in the audit record as `content-type` and `sniffed`, and a redirect chain
+that crossed hosts appears as `via`. When the policy sets a
+`mime-types` allow-list, the declared and sniffed types are additionally
+checked before the body is delivered.
 
 See the [security model](security-model.md) for the guarantees and limits of
 these mechanisms.

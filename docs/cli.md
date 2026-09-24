@@ -58,7 +58,7 @@ audit target is a file or disabled.
 |---|---:|---|
 | `-policy FILE` | — | Read the base configuration from a YAML policy file |
 | `-init-policy FILE` | — | Write a commented policy template and exit; `-` writes to stdout |
-| `-profile` | false | Run and write the script SHA-256 plus observed commands and hosts to a manifest |
+| `-profile` | false | Run and write the script SHA-256 plus observed commands, hosts (redirect hops included), and response media types to a manifest |
 | `-profile-output FILE` | `<script>.manifest.yaml` | Set the generated manifest path; requires `-profile` |
 | `-manifest FILE` | — | Verify the script SHA-256 and restrict commands and hosts to a manifest |
 | `-urls p1,p2` | GitHub's common download hosts | Replace the URL prefixes available to in-process `curl` and `wget` |
@@ -103,11 +103,20 @@ hosts:
 ```
 
 `os` uses Go's canonical operating-system name (such as `linux` or `darwin`).
-Commands and hosts are sorted and de-duplicated. Profiling is discovery mode:
-the audit and profile collectors remain active, but Smash bypasses its disabled
-and sensitive command gates, strict mode, mocks, in-process downloader policy,
-general egress guard, sleep cap, in-root native executable gate, and raw-socket
-guard. Real programs and network clients therefore execute directly. Their own
+Commands, hosts, and media types are sorted and de-duplicated. Profiling is
+discovery mode: the audit and profile collectors remain active, but Smash
+bypasses its disabled and sensitive command gates, strict mode, mocks, general
+egress guard, sleep cap, in-root native executable gate, and raw-socket guard.
+`curl` and `wget` are the exception: they run through the same in-process
+downloader as an enforced run, in an observe-only configuration — every URL,
+method, and media type is admitted, the transport is pinned to the default
+resolver, timeout, and size caps regardless of the policy under construction,
+and `-o`/`@file` paths stay confined to the root. Discovery therefore
+exercises exactly the implementation a manifest is later enforced against,
+and each response's redirect hops and declared media type land in the audit
+and the generated manifest — including redirect-target hosts (such as a
+GitHub release's asset host) that never appear on the command line. Every
+other program and network client executes directly. Their own
 external-command failures retain their real status in the audit and in shell
 conditions and `&&`/`||` lists. Only `set -e` termination is ignored, so a
 false probe cannot select a success branch and errexit cannot truncate later
@@ -128,8 +137,25 @@ manifest that names a different OS is also rejected. The manifest then enables
 strict command gating, replaces the command allow-list,
 replaces URL-prefix grants with exact host grants, and uses the same host set
 for explicitly allowed Git. Other policy settings such as mocks, environment,
-timeouts, request limits, and disabled commands still apply. `-profile` and
-`-manifest` are mutually exclusive.
+timeouts, request limits, and disabled commands still apply.
+
+A manifest may also carry a `mime-types` list — the same response-body MIME
+allow-list as a policy file's `network.mime-types` (bare media types or
+`type/*` wildcards, checked against both the declared `Content-Type` and a
+content sniff). The profiler fills it with the declared types it observed:
+
+```yaml
+mime-types:
+  - application/gzip
+  - application/octet-stream
+```
+
+If any observed download body arrived without a parseable `Content-Type`, the
+field is omitted entirely — enforcement denies a missing `Content-Type`
+whenever a list is set, so writing one would break replaying the profiled
+script. Review and edit the list like the rest of the manifest. Absent,
+downloads are unrestricted by type; when present it overrides any policy-file
+`mime-types` for the run. `-profile` and `-manifest` are mutually exclusive.
 
 A profile describes one observed execution path, not every path the script can
 take. Arguments, environment, platform, server responses, and timing can expose

@@ -1,4 +1,4 @@
-package sandbox
+package network
 
 import (
 	"encoding/binary"
@@ -27,9 +27,6 @@ func TestDNSServerValidation(t *testing.T) {
 		if err := ValidateDNSServer(input); err == nil {
 			t.Errorf("ValidateDNSServer(%q) accepted an invalid endpoint", input)
 		}
-	}
-	if got := DefaultPolicy().DNSServer; got != DefaultDNSServer {
-		t.Errorf("default DNS server = %q, want %q", got, DefaultDNSServer)
 	}
 }
 

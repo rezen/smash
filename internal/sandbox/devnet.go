@@ -11,10 +11,10 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path"
-	"strings"
 
 	"mvdan.cc/sh/v3/interp"
+
+	"github.com/rezen/smash/internal/network"
 )
 
 // netDetectOpenMiddleware logs and denies any /dev/tcp or /dev/udp open.
@@ -27,24 +27,11 @@ import (
 func netDetectOpenMiddleware(log io.Writer) OpenMiddleware {
 	return func(next interp.OpenHandlerFunc) interp.OpenHandlerFunc {
 		return func(ctx context.Context, name string, flag int, perm os.FileMode) (io.ReadWriteCloser, error) {
-			if proto, host, port, ok := parseDevNet(name); ok {
+			if proto, host, port, ok := network.ParseDevNet(name); ok {
 				fmt.Fprintf(log, "[sandbox] %s socket attempt detected: %s:%s (denied)\n", proto, host, port)
 				return nil, fmt.Errorf("%s: [sandbox] raw network device access denied", name)
 			}
 			return next(ctx, name, flag, perm)
 		}
 	}
-}
-
-// parseDevNet recognises bash's /dev/tcp and /dev/udp pseudo-device paths.
-func parseDevNet(name string) (proto, host, port string, ok bool) {
-	name = path.Clean(name)
-	for _, pr := range [...]string{"tcp", "udp"} {
-		if rest, found := strings.CutPrefix(name, "/dev/"+pr+"/"); found {
-			if h, p, ok := strings.Cut(rest, "/"); ok && h != "" && p != "" && !strings.Contains(p, "/") {
-				return pr, h, p, true
-			}
-		}
-	}
-	return "", "", "", false
 }

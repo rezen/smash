@@ -40,7 +40,7 @@ import (
 	"mvdan.cc/sh/v3/syntax"
 
 	"github.com/rezen/smash/internal/command"
-	"github.com/rezen/smash/internal/shebang"
+	"github.com/rezen/smash/internal/shell"
 	"github.com/rezen/smash/internal/tool"
 )
 
@@ -70,9 +70,15 @@ type Config struct {
 	Emulation Emulation      // optional target-OS emulation; zero value = off
 	Timeout   time.Duration  // wall-time bound for one Run; zero = DefaultTimeout
 	// Profile observes a script without enforcing Smash's command, mock,
-	// downloader, egress, sleep, or raw-socket policy layers. External commands
-	// and network clients run directly; use only with separate OS confinement or
-	// a script trusted enough to execute unrestricted.
+	// egress, sleep, or raw-socket policy layers. curl/wget still run through
+	// the shared in-process downloader, in an observe-only configuration:
+	// every URL, method and media type is admitted, the transport is pinned
+	// to safe defaults, and output stays confined to Root — so discovery
+	// exercises the same implementation a manifest is later enforced against
+	// and responses (content types, redirect hops) reach the audit trail.
+	// Every other external command and network client runs directly; use only
+	// with separate OS confinement or a script trusted enough to execute
+	// unrestricted.
 	Profile bool
 
 	// AllowSudo answers sudo/doas credential probes (`sudo -v`, `sudo -n -l
@@ -168,7 +174,7 @@ func RunContext(ctx context.Context, cfg Config, name, src string) error {
 // with.
 func prepareRun(cfg Config, name, src string) (Config, *interp.Runner, *syntax.File, error) {
 	cfg = cfg.normalized()
-	cfg.Posix = cfg.Posix || shebang.IsSh(src)
+	cfg.Posix = cfg.Posix || shell.IsSh(src)
 	prog, err := parseBash(name, src)
 	if err != nil {
 		return cfg, nil, nil, err
@@ -308,14 +314,19 @@ func (s *execStack) add(name string, mw Middleware) {
 //	sh-interp    `sh -c` parsed and re-run confined, so nested commands stay visible
 //	tool-*       in-process mktemp/sha256sum/base64 (portable, honoring TMPDIR)
 //	uname        emulated target OS (Emulation)
-//	http         curl/wget served by net/http under the URL policy, writing inside root
+//	http         curl/wget served by net/http, writing inside root — in both
+//	             modes: under the URL/method/MIME policy when enforcing, and
+//	             under the everything-admitted observe config when profiling,
+//	             so discovery exercises the same downloader the manifest will
+//	             later be enforced against and responses become observable
 //	egress       every other network-capable command judged by its parsed intent
 //	gate         allow-list / sensitive / in-root / unlisted — the last word
 //	tty          hand interactive, terminal-facing commands the script PTY
 //
 // Profile mode observes without enforcing: only unwrap, audit, sudo-grant,
-// sh-interp, the tools, uname and tty are installed. TestProfileModeLayers
-// pins that carve-out; TestExecLayerOrdering pins the order above.
+// sh-interp, the tools, uname, http (observe config) and tty are installed.
+// TestProfileModeLayers pins that carve-out; TestExecLayerOrdering pins the
+// order above.
 func execLayers(cfg Config) (*execStack, error) {
 	enforcing := !cfg.Profile
 	e := cfg.Emulation
@@ -358,6 +369,12 @@ func execLayers(cfg Config) (*execStack, error) {
 			allowedPaths:           resolveAllowedPaths(cfg),
 			interpret:              confinedScriptRunner(cfg),
 		}))
+	} else {
+		httpMW, err := observeHTTPMiddleware(cfg.Network, cfg.Root)
+		if err != nil {
+			return nil, err
+		}
+		s.add("http", httpMW)
 	}
 	if cfg.ControllingTTY != nil {
 		s.add("tty", controllingTTYMiddleware(cfg.ControllingTTY))

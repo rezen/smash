@@ -5,13 +5,14 @@ package sandbox
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 
 	"golang.org/x/sys/unix"
 	"mvdan.cc/sh/v3/interp"
+
+	"github.com/rezen/smash/internal/shell"
 )
 
 // controllingTTYMiddleware marks commands whose stdout is the script terminal.
@@ -21,11 +22,11 @@ import (
 func controllingTTYMiddleware(tty *os.File) Middleware {
 	return func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 		return func(ctx context.Context, args []string) error {
-			if !sameOpenFile(interp.HandlerCtx(ctx).Stdout, tty) {
+			if !shell.SameOpenFile(interp.HandlerCtx(ctx).Stdout, tty) {
 				return next(ctx, args)
 			}
 			err := next(interp.WithControllingTTY(ctx, tty), args)
-			return errors.Join(err, restoreTTY(tty))
+			return errors.Join(err, shell.RestoreTTY(tty))
 		}
 	}
 }
@@ -45,36 +46,4 @@ func controllingTTYOpenMiddleware(tty *os.File) OpenMiddleware {
 			return os.NewFile(uintptr(fd), tty.Name()), nil
 		}
 	}
-}
-
-func sameOpenFile(w io.Writer, tty *os.File) bool {
-	f, ok := w.(*os.File)
-	if !ok || f == nil || tty == nil {
-		return false
-	}
-	if f == tty {
-		return true
-	}
-	a, err := f.Stat()
-	if err != nil {
-		return false
-	}
-	b, err := tty.Stat()
-	return err == nil && os.SameFile(a, b)
-}
-
-// restoreTTY reopens the slave into the original descriptor number. Darwin
-// revokes that descriptor when a controlling-terminal session leader exits;
-// keeping its number stable means the interpreter and later commands can keep
-// using the *os.File already stored in Config.
-func restoreTTY(tty *os.File) error {
-	fd, err := unix.Open(tty.Name(), unix.O_RDWR|unix.O_NOCTTY, 0)
-	if err != nil {
-		return fmt.Errorf("reopening script terminal: %w", err)
-	}
-	defer unix.Close(fd)
-	if err := unix.Dup2(fd, int(tty.Fd())); err != nil {
-		return fmt.Errorf("restoring script terminal: %w", err)
-	}
-	return nil
 }

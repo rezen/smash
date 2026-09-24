@@ -63,12 +63,16 @@ smash -manifest install.manifest.yaml fixtures/fly.sh --non-interactive
 ```
 
 The manifest records the profiling OS, binds the run to the script body's
-SHA-256, and contains sorted, de-duplicated `commands` and `hosts` lists. A
+SHA-256, and contains sorted, de-duplicated `commands`, `hosts`, and
+`mime-types` lists — the hosts include redirect targets, and the media types
+are the ones the responses actually declared, because profiling runs `curl`
+and `wget` through the same in-process downloader an enforced run uses (in an
+observe-only configuration that admits everything). A
 manifest run fails before execution if the OS or script changed, enables strict
 command gating, and replaces the run's command and network grants with those
-lists. Profile mode is
+lists. Profile mode is otherwise
 deliberately unrestricted: Smash audits but does not enforce command, disabled,
-mock, downloader, egress, sleep, or raw-socket policy layers. Run profiling
+mock, egress, sleep, or raw-socket policy layers. Run profiling
 only for a trusted script or inside an OS sandbox/container. Command statuses
 remain unchanged for conditions and `&&`/`||` lists, while profile mode ignores
 the shell's `set -e` termination action so it does not truncate discovery. It
@@ -96,6 +100,7 @@ raw command line:
     - write path $TMPDIR/tool.tar.gz
   command: curl -fsSL https://example.com/tool.tar.gz -o $TMPDIR/tool.tar.gz
   exit: 0
+  content-type: application/gzip
 - name: tar
   resources:
     - read archive $TMPDIR/tool.tar.gz

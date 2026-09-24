@@ -1,6 +1,10 @@
-package shebang
+package shell
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestInterpreter(t *testing.T) {
 	cases := []struct {
@@ -39,5 +43,28 @@ func TestIsSh(t *testing.T) {
 		if got := IsSh(src); got != want {
 			t.Errorf("IsSh(%q) = %v, want %v", src, got, want)
 		}
+	}
+}
+
+func TestInterpreterFromFile(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(content), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	if got, ok := InterpreterFromFile(write("script", "#!/usr/bin/env bash\necho hi\n")); got != "bash" || !ok {
+		t.Errorf("InterpreterFromFile(script) = %q, %v; want %q, true", got, ok, "bash")
+	}
+	if got, ok := InterpreterFromFile(write("binary", "\x7fELF junk")); ok {
+		t.Errorf("InterpreterFromFile(binary) = %q, true; want ok=false", got)
+	}
+	if _, ok := InterpreterFromFile(filepath.Join(dir, "missing")); ok {
+		t.Error("InterpreterFromFile(missing) = ok; want false")
+	}
+	if _, ok := InterpreterFromFile(""); ok {
+		t.Error(`InterpreterFromFile("") = ok; want false`)
 	}
 }

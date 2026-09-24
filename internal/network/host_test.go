@@ -1,8 +1,8 @@
-package hostname
+package network
 
 import "testing"
 
-func TestFromEndpoint(t *testing.T) {
+func TestHostFromEndpoint(t *testing.T) {
 	cases := []struct {
 		target, want string
 	}{
@@ -30,19 +30,19 @@ func TestFromEndpoint(t *testing.T) {
 		{"", ""},
 		// QUIRK, preserved from the pre-extraction parsers: SplitHostPort
 		// does not require a numeric port, so a path with a colon "parses".
-		// Harmless — Valid rejects "dir/file" as an allow-list entry — but a
-		// tightening (reject "/" after the split) is a behavior change and
-		// belongs to its own decision, not to this refactor.
+		// Harmless — ValidHost rejects "dir/file" as an allow-list entry —
+		// but a tightening (reject "/" after the split) is a behavior change
+		// and belongs to its own decision, not to this refactor.
 		{"dir/file:name", "dir/file"},
 	}
 	for _, c := range cases {
-		if got := FromEndpoint(c.target); got != c.want {
-			t.Errorf("FromEndpoint(%q) = %q, want %q", c.target, got, c.want)
+		if got := HostFromEndpoint(c.target); got != c.want {
+			t.Errorf("HostFromEndpoint(%q) = %q, want %q", c.target, got, c.want)
 		}
 	}
 }
 
-func TestFromGitRemote(t *testing.T) {
+func TestHostFromGitRemote(t *testing.T) {
 	cases := []struct {
 		target, want string
 	}{
@@ -59,45 +59,45 @@ func TestFromGitRemote(t *testing.T) {
 		{"", ""},
 	}
 	for _, c := range cases {
-		if got := FromGitRemote(c.target); got != c.want {
-			t.Errorf("FromGitRemote(%q) = %q, want %q", c.target, got, c.want)
+		if got := HostFromGitRemote(c.target); got != c.want {
+			t.Errorf("HostFromGitRemote(%q) = %q, want %q", c.target, got, c.want)
 		}
 	}
 }
 
-func TestValid(t *testing.T) {
+func TestValidHost(t *testing.T) {
 	valid := []string{"example.com", "1.2.3.4", "2001:db8::1", "a"}
 	for _, h := range valid {
-		if !Valid(h) {
-			t.Errorf("Valid(%q) = false, want true", h)
+		if !ValidHost(h) {
+			t.Errorf("ValidHost(%q) = false, want true", h)
 		}
 	}
 	invalid := []string{"", "example.com/x", "user@example.com", "two words", `a\b`, "example.com:443"}
 	for _, h := range invalid {
-		if Valid(h) {
-			t.Errorf("Valid(%q) = true, want false", h)
+		if ValidHost(h) {
+			t.Errorf("ValidHost(%q) = true, want false", h)
 		}
 	}
 }
 
-// TestEndpointMatchesRecording pins the property the package exists for: what
-// the Profiler records for a target is exactly what enforcement extracts from
-// the same target later — one function, so it holds by construction, and this
-// test keeps anyone from splitting it back into two.
+// TestEndpointMatchesRecording pins the property the host functions exist
+// for: what the Profiler records for a target is exactly what enforcement
+// extracts from the same target later — one function, so it holds by
+// construction, and this test keeps anyone from splitting it back into two.
 func TestEndpointMatchesRecording(t *testing.T) {
 	targets := []string{
 		"https://example.com/x", "user@example.com:22", "[2001:db8::1]:443",
 	}
 	for _, target := range targets {
-		host := FromEndpoint(target)
+		host := HostFromEndpoint(target)
 		if host == "" {
-			t.Fatalf("FromEndpoint(%q) = %q; test target must parse", target, host)
+			t.Fatalf("HostFromEndpoint(%q) = %q; test target must parse", target, host)
 		}
-		if !Valid(host) {
-			t.Errorf("FromEndpoint(%q) = %q, which Valid rejects: recorded manifests would fail validation", target, host)
+		if !ValidHost(host) {
+			t.Errorf("HostFromEndpoint(%q) = %q, which ValidHost rejects: recorded manifests would fail validation", target, host)
 		}
-		if again := FromEndpoint(host); again != host {
-			t.Errorf("FromEndpoint is not idempotent for %q: %q → %q", target, host, again)
+		if again := HostFromEndpoint(host); again != host {
+			t.Errorf("HostFromEndpoint is not idempotent for %q: %q → %q", target, host, again)
 		}
 	}
 }

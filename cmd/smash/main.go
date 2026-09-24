@@ -33,6 +33,7 @@ import (
 	"mvdan.cc/sh/v3/expand"
 
 	profilemanifest "github.com/rezen/smash/internal/manifest"
+	"github.com/rezen/smash/internal/network"
 	"github.com/rezen/smash/internal/policy"
 	"github.com/rezen/smash/internal/sandbox"
 	"github.com/rezen/smash/internal/splitview"
@@ -94,7 +95,7 @@ func runCLI(argv []string) error {
 	if err != nil {
 		return err
 	}
-	scriptClient, err := sandbox.NewHTTPClient(60*time.Second, effectiveDNS(pol, fl))
+	scriptClient, err := network.NewHTTPClient(60*time.Second, effectiveDNS(pol, fl))
 	if err != nil {
 		return err
 	}
@@ -202,7 +203,7 @@ func parseFlags(argv []string) (*cliFlags, error) {
 	fs.StringVar(&fl.urls, "urls", "", "comma-separated URL prefixes to allow (replaces the default)")
 	fs.BoolVar(&fl.urlsGitHub, "urls-github", false, "also allow GitHub release downloads (github.com, api.github.com, raw/codeload/objects/release-assets hosts)")
 	fs.StringVar(&fl.gitHosts, "git-hosts", "", "comma-separated hosts git may reach (replaces the default github.com,gitlab.com,bitbucket.org)")
-	fs.StringVar(&fl.dnsServer, "dns-server", sandbox.DefaultDNSServer, "DNS resolver IP[:port] for HTTP downloads; an empty value uses the system resolver")
+	fs.StringVar(&fl.dnsServer, "dns-server", network.DefaultDNSServer, "DNS resolver IP[:port] for HTTP downloads; an empty value uses the system resolver")
 	fs.StringVar(&fl.allow, "allow", "", "comma-separated commands to add to the allow-list (also the way to permit a sensitive command such as sudo or python3)")
 	fs.StringVar(&fl.disable, "disable", "", "comma-separated commands to disable outright")
 	fs.BoolVar(&fl.strict, "strict", false, "block every command that is not allow-listed; by default an unlisted command runs and is flagged in the audit log, and only sensitive ones (sudo, shells, interpreters, host package managers, …) are blocked")
@@ -241,20 +242,22 @@ func resolveScriptArg(pol *policy.File, fl *cliFlags) (script string, args []str
 // effectiveDNS is the one place the DNS-resolver precedence lives: a typed
 // -dns-server beats the policy file beats the default. Profile mode pins the
 // default — enforcement is off, and profiling must not fail because the policy
-// under construction names a broken resolver. The script fetch needs this
+// under construction names a broken resolver; the in-sandbox observe
+// transport (sandbox.observeHTTPMiddleware) pins the same defaults for the
+// script's own curl/wget for the same reason. The script fetch needs this
 // value before a Config exists; a non-profile run's Config ends up with the
 // same value through the ordinary policy-then-typed-flags layering in
 // buildConfig.
 func effectiveDNS(pol *policy.File, fl *cliFlags) string {
 	switch {
 	case fl.profile:
-		return sandbox.DefaultDNSServer
+		return network.DefaultDNSServer
 	case fl.set["dns-server"]:
 		return fl.dnsServer
 	case pol.Network != nil && pol.Network.DNSServer != nil:
 		return *pol.Network.DNSServer
 	}
-	return sandbox.DefaultDNSServer
+	return network.DefaultDNSServer
 }
 
 // buildConfig assembles the run's Config in precedence order: sandbox

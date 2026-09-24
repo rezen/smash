@@ -100,12 +100,21 @@ type CurlParams struct {
 	Data       []string `flag:"-d,--data,--data-raw,--data-binary,--data-urlencode" secret:"true"`
 	WriteOut   string   `flag:"-w,--write-out"`              // printed after the transfer; %{http_code} and %{url_effective} are supported
 	URL        string   `operand:"url" resource:"url,fetch"` // declared before Output so the log reads fetch-then-write
+	URLFlag    string   `flag:"--url" resource:"url,fetch"`  // curl's explicit spelling of the URL operand
 	Output     string   `flag:"-o,--output" resource:"path,write,stdout"`
 }
 
+// The unmodelled value flags matter beyond politeness: a value flag the spec
+// does not know keeps its space-separated value, which lands in Operands and
+// can be mistaken for the URL ("curl -x http://proxy:8080 https://x").
 var curlSpec = specOf(CurlParams{}, true,
 	"-u", "--user", "--connect-timeout", "--max-time", "--retry", "--retry-delay",
-	"--retry-max-time", "--proto", "--proto-default", "--proto-redir")
+	"--retry-max-time", "--proto", "--proto-default", "--proto-redir",
+	"--cacert", "--capath", "-E", "--cert", "--key", "--ciphers",
+	"-m", "--max-redirs", "-x", "--proxy", "--resolve", "--interface",
+	"-c", "--cookie-jar", "-T", "--upload-file", "-F", "--form",
+	"--output-dir", "-r", "--range", "--limit-rate", "--expect100-timeout",
+	"-C", "--continue-at")
 
 func curlParamsFrom(p ParsedCommand) (c CurlParams) { bind(p, &c); return c }
 func (c CurlParams) Args() []string                 { return render("curl", c, true) }
@@ -127,7 +136,10 @@ type WgetParams struct {
 
 var wgetSpec = specOf(WgetParams{}, true,
 	"-a", "--append-output", "--referer", "-t", "--tries", "-T", "--timeout",
-	"-w", "--wait", "--waitretry", "-P", "--directory-prefix", "--post-data", "--post-file")
+	"-w", "--wait", "--waitretry", "-P", "--directory-prefix", "--post-data", "--post-file",
+	"--ca-certificate", "--certificate", "--private-key", "--limit-rate",
+	"--user", "--password", "--http-user", "--http-password",
+	"--bind-address", "--domains", "--exclude-domains", "--ciphers", "--secure-protocol")
 
 func wgetParamsFrom(p ParsedCommand) (w WgetParams) { bind(p, &w); return w }
 func (w WgetParams) Args() []string                 { return render("wget", w, true) }

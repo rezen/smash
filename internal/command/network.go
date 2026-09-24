@@ -82,8 +82,12 @@ func (Curl) Request(p ParsedCommand) Request {
 
 // Request converts the typed params to a fetch intent.
 func (c CurlParams) Request() Request {
+	u := c.URL
+	if u == "" {
+		u = c.URLFlag // curl --url is the flag spelling of the operand
+	}
 	r := Request{
-		URL:        c.URL,
+		URL:        u,
 		Method:     strings.ToUpper(c.Method),
 		Headers:    http.Header{},
 		Output:     c.Output,
@@ -159,9 +163,10 @@ func (Wget) Params(p ParsedCommand) Params         { return wgetParamsFrom(p) }
 func (Wget) Request(p ParsedCommand) Request       { return wgetParamsFrom(p).Request() }
 
 // Request converts the typed params to a fetch intent. wget always follows
-// redirects.
+// redirects, and with no -O derives the output filename from the URL the way
+// the real tool does.
 func (w WgetParams) Request() Request {
-	r := Request{URL: w.URL, Headers: http.Header{}, Output: w.Output, Follow: true}
+	r := Request{URL: w.URL, Headers: http.Header{}, Output: w.Output, RemoteName: w.Output == "", Follow: true}
 	for _, h := range w.Headers {
 		addHeaderLine(r.Headers, h)
 	}

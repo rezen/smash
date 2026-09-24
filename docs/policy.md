@@ -44,6 +44,7 @@ network:
   github: false
   git-hosts: [github.com]
   methods: [GET, HEAD]
+  mime-types: [application/gzip, application/octet-stream, text/*]
   max-response: 200MiB
   max-request: 8MiB
   timeout: 60s
@@ -136,6 +137,25 @@ inputs must resolve inside the run root.
 `headers` injects values into every in-process request, which can keep a broker
 token out of the installer source.
 
+`mime-types` restricts what an in-process `curl`/`wget` response body may be.
+An entry is a bare media type (`application/gzip`) or a subtype wildcard
+(`text/*`); matching is case-insensitive and ignores parameters such as
+`; charset=utf-8` (`*/*` and parameterized entries are rejected — omit the key
+to allow everything). When the list is set, a response is refused unless its
+declared `Content-Type` matches an entry AND its first bytes do not sniff
+(`http.DetectContentType` on the first 512 bytes, sharpened by a magic-number
+table for archives, packages, native executables, and shebanged scripts) as a
+disallowed type — the mislabeled case, an HTML error page served as an
+archive, is exactly what the sniff catches. A response with no parseable
+`Content-Type` is refused. Known coarse sniffs are tolerated: a binary type
+detected under an `application/octet-stream` declaration (tar, xz, zstd,
+executables…), gzip as `application/x-gzip`, and scripts, JSON and YAML
+under a text-ish declared type — the refined detection appears in the
+audit's `sniffed:` key without adding denials. HEAD requests and empty
+bodies deliver nothing, so they are exempt. This gates declared and
+sniffed types only; it is not content verification — pair it with `sha256sum`
+checks for that.
+
 `dns-server` selects an IP address and optional port for HTTP hostname lookups.
 It defaults to Quad9's malware-blocking, DNSSEC-validating resolver at
 `9.9.9.9:53`. Set `dns-server: ""` to use the host's system resolver, or replace
@@ -144,8 +164,10 @@ initial remote script fetch and to in-process `curl`/`wget`; it does not control
 DNS performed by explicitly allowed host binaries or by an HTTP proxy. Queries
 to this resolver use ordinary unencrypted DNS.
 
-An explicitly empty `urls: []` means deny every fetch. A key with no value,
-such as an unfinished `urls:`, is null and leaves the defaults unchanged.
+An explicitly empty `urls: []` means deny every fetch, and `mime-types: []`
+means deny every response body. A key with no value, such as an unfinished
+`urls:`, is null and leaves the defaults unchanged — for `mime-types` that
+means no MIME restriction at all.
 
 ## Emulation
 

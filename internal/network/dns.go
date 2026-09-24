@@ -1,4 +1,4 @@
-package sandbox
+package network
 
 import (
 	"context"
@@ -10,7 +10,7 @@ import (
 )
 
 // DefaultDNSServer is Quad9's malware-blocking, DNSSEC-validating resolver.
-// An empty Policy.DNSServer opts back into the host's system resolver.
+// An empty dnsServer opts back into the host's system resolver.
 const DefaultDNSServer = "9.9.9.9:53"
 
 // NewHTTPClient builds the transport shared by initial script loading and the

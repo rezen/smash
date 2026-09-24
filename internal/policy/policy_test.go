@@ -13,6 +13,7 @@ import (
 
 	"mvdan.cc/sh/v3/expand"
 
+	"github.com/rezen/smash/internal/network"
 	"github.com/rezen/smash/internal/sandbox"
 )
 
@@ -134,7 +135,7 @@ func TestTemplateUncomments(t *testing.T) {
 	if n.Timeout == nil || time.Duration(*n.Timeout) != 60*time.Second {
 		t.Errorf("network timeout = %v", n.Timeout)
 	}
-	if n.DNSServer == nil || *n.DNSServer != sandbox.DefaultDNSServer {
+	if n.DNSServer == nil || *n.DNSServer != network.DefaultDNSServer {
 		t.Errorf("dns-server = %v", n.DNSServer)
 	}
 	if f.Emulation == nil || f.Emulation.UnameOS != "Linux" || f.Emulation.UnameArch != "x86_64" {
@@ -172,6 +173,7 @@ network:
   github: true
   git-hosts: [git.example.com]
   methods: [get, head, post]
+  mime-types: [application/gzip, text/*]
   max-response: 1MiB
   max-request: 64KiB
   timeout: 5s
@@ -209,6 +211,13 @@ emulation:
 	}
 	if !cfg.Network.AllowedMethods["POST"] || len(cfg.Network.AllowedMethods) != 3 {
 		t.Errorf("methods = %v, want the three upper-cased", cfg.Network.AllowedMethods)
+	}
+	if !slices.Equal(cfg.Network.AllowedMIMETypes, []string{"application/gzip", "text/*"}) {
+		t.Errorf("mime-types = %v", cfg.Network.AllowedMIMETypes)
+	}
+	if !cfg.Network.AllowsMIME("application/gzip") || !cfg.Network.AllowsMIME("text/x-shellscript") ||
+		cfg.Network.AllowsMIME("image/png") {
+		t.Error("the mime-types list does not gate as written")
 	}
 	if cfg.Network.MaxResponse != 1<<20 || cfg.Network.MaxRequest != 64<<10 || cfg.Network.Timeout != 5*time.Second {
 		t.Errorf("caps = response %d / request %d / %v", cfg.Network.MaxResponse, cfg.Network.MaxRequest, cfg.Network.Timeout)
@@ -271,14 +280,17 @@ func TestNoSectionKeepsDefaults(t *testing.T) {
 // a half-written key, not an instruction to deny everything. Only "urls: []"
 // is that — see TestEmptyURLListDeniesEverything.
 func TestNullListIsNotSet(t *testing.T) {
-	f := parse(t, "network:\n  urls:\n  methods:\n")
-	if f.Network.URLs != nil || f.Network.Methods != nil {
-		t.Errorf("null lists = %#v / %#v, want nil", f.Network.URLs, f.Network.Methods)
+	f := parse(t, "network:\n  urls:\n  methods:\n  mime-types:\n")
+	if f.Network.URLs != nil || f.Network.Methods != nil || f.Network.MIMETypes != nil {
+		t.Errorf("null lists = %#v / %#v / %#v, want nil", f.Network.URLs, f.Network.Methods, f.Network.MIMETypes)
 	}
 	def := newConfig(t)
-	cfg := applied(t, "network:\n  urls:\n")
+	cfg := applied(t, "network:\n  urls:\n  mime-types:\n")
 	if !slices.Equal(cfg.Network.AllowedPrefixes, def.Network.AllowedPrefixes) {
 		t.Errorf("urls = %v, want the defaults", cfg.Network.AllowedPrefixes)
+	}
+	if cfg.Network.AllowedMIMETypes != nil {
+		t.Errorf("mime-types = %#v, want nil (no restriction)", cfg.Network.AllowedMIMETypes)
 	}
 }
 
@@ -291,6 +303,18 @@ func TestEmptyURLListDeniesEverything(t *testing.T) {
 	}
 	if cfg.Network.Allows(mustURL(t, "https://github.com/x")) {
 		t.Error("a default prefix survived an explicit empty list")
+	}
+}
+
+// TestEmptyMIMEListDeniesEverything: same rule for mime-types — null leaves
+// the gate absent, [] denies every response body.
+func TestEmptyMIMEListDeniesEverything(t *testing.T) {
+	cfg := applied(t, "network:\n  mime-types: []\n")
+	if cfg.Network.AllowedMIMETypes == nil || len(cfg.Network.AllowedMIMETypes) != 0 {
+		t.Fatalf("mime-types = %#v, want an empty non-nil list", cfg.Network.AllowedMIMETypes)
+	}
+	if cfg.Network.AllowsMIME("application/gzip") {
+		t.Error("an explicit empty mime-types list must deny every type")
 	}
 }
 

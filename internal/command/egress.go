@@ -22,7 +22,7 @@ package command
 import (
 	"strings"
 
-	"github.com/rezen/smash/internal/hostname"
+	"github.com/rezen/smash/internal/network"
 )
 
 // EgressKind says what shape of thing an egress target is.
@@ -72,7 +72,7 @@ func ClassifyEgress(target string) EgressKind {
 	if strings.Contains(target, "://") {
 		return EgressURL
 	}
-	if hostname.FromEndpoint(target) != "" {
+	if network.HostFromEndpoint(target) != "" {
 		return EgressEndpoint
 	}
 	return EgressIndicator
@@ -94,7 +94,7 @@ func (Git) EgressKind(_ ParsedCommand, target string) EgressKind {
 	if strings.Contains(target, "://") {
 		return EgressURL
 	}
-	if hostname.FromGitRemote(target) != "" {
+	if network.HostFromGitRemote(target) != "" {
 		return EgressEndpoint
 	}
 	return EgressIndicator

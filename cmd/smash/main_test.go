@@ -1,6 +1,8 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -266,32 +268,68 @@ func TestProfileFlagTakesTheScriptAsPositionalArgument(t *testing.T) {
 	}
 }
 
+// TestProfileBypassesDownloaderPolicyAndMocks: profiling runs curl through
+// the shared in-process downloader with everything admitted — the hostile
+// policy (deny-all URLs, a broken resolver, disabled + mocked curl) must not
+// truncate discovery, and the generated manifest records what the response
+// actually was: the redirect target host and the declared media type.
 func TestProfileBypassesDownloaderPolicyAndMocks(t *testing.T) {
+	body := []byte("\x1f\x8b\x08\x00tool-bytes")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/redir":
+			http.Redirect(w, r, "/tool", http.StatusFound)
+		case "/tool":
+			w.Header().Set("Content-Type", "application/gzip")
+			w.Write(body)
+		case "/untyped":
+			w.Header()["Content-Type"] = nil
+			w.Write([]byte("bytes"))
+		}
+	}))
+	defer srv.Close()
+
 	dir := t.TempDir()
-	bin := filepath.Join(dir, "bin")
-	if err := os.Mkdir(bin, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	fakeCurl := write(t, bin, "curl", "#!/bin/sh\nexit 0\n")
-	if err := os.Chmod(fakeCurl, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	script := write(t, dir, "network.sh", "set -e\ncurl https://blocked.example.test/tool\n")
-	pol := write(t, dir, "deny-network.yaml", "strict: true\nenv:\n  PATH: "+bin+"\ncommands:\n  disable: [curl]\nnetwork:\n  urls: []\n  dns-server: not-an-ip\nmocks:\n  - match: {name: [curl]}\n    exit: 9\n")
+	script := write(t, dir, "network.sh", "set -e\ncurl -fsSL "+srv.URL+"/redir -o tool.bin\n")
+	pol := write(t, dir, "deny-network.yaml", "strict: true\ncommands:\n  disable: [curl]\nnetwork:\n  urls: []\n  dns-server: not-an-ip\nmocks:\n  - match: {name: [curl]}\n    exit: 9\n")
 	manifestPath := filepath.Join(dir, "network.manifest.yaml")
 	log, err := run(t, dir, "-policy", pol, "-profile", "-profile-output", manifestPath, script)
 	if err != nil {
 		t.Fatalf("unrestricted profile run: %v\n%s", err, log)
 	}
-	if strings.Contains(log, "disabled command") || strings.Contains(log, "URL not in allow-list") || strings.Contains(log, "unlisted command") {
-		t.Fatalf("profile mode enforced policy:\n%s", log)
+	for _, denial := range []string{"disabled command", "URL not in allow-list", "unlisted command", "[sandbox]"} {
+		if strings.Contains(log, denial) {
+			t.Fatalf("profile mode enforced policy (%q):\n%s", denial, log)
+		}
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "sandbox", "home", "tool.bin")) // the run's cwd is <root>/home
+	if err != nil || !slices.Equal(got, body) {
+		t.Errorf("downloaded body = %q, %v; the mock must not fire and the fetch must be in-process", got, err)
 	}
 	m, err := profilemanifest.Load(manifestPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(m.Commands, []string{"curl"}) || !slices.Equal(m.Hosts, []string{"blocked.example.test"}) {
+	if !slices.Equal(m.Commands, []string{"curl"}) || !slices.Equal(m.Hosts, []string{"127.0.0.1"}) {
 		t.Errorf("profile = commands %v, hosts %v", m.Commands, m.Hosts)
+	}
+	if !slices.Equal(m.MIMETypes, []string{"application/gzip"}) {
+		t.Errorf("profile mime-types = %v, want the observed declared type", m.MIMETypes)
+	}
+
+	// A response body with no declared Content-Type poisons the list: writing
+	// one would make enforcement deny the very script that was profiled.
+	script = write(t, dir, "untyped.sh", "curl -fsS "+srv.URL+"/untyped -o x.bin\ncurl -fsSL "+srv.URL+"/tool -o tool.bin\n")
+	manifestPath = filepath.Join(dir, "untyped.manifest.yaml")
+	if log, err := run(t, dir, "-profile", "-profile-output", manifestPath, script); err != nil {
+		t.Fatalf("untyped profile run: %v\n%s", err, log)
+	}
+	m, err = profilemanifest.Load(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.MIMETypes != nil {
+		t.Errorf("mime-types = %v, want omitted after an untyped response body", m.MIMETypes)
 	}
 }
 

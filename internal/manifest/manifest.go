@@ -15,7 +15,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/rezen/smash/internal/command"
-	"github.com/rezen/smash/internal/hostname"
+	"github.com/rezen/smash/internal/network"
 	"github.com/rezen/smash/internal/sandbox"
 )
 
@@ -29,6 +29,16 @@ type Manifest struct {
 	Script   Script   `yaml:"script"`
 	Commands []string `yaml:"commands"`
 	Hosts    []string `yaml:"hosts"`
+	// MIMETypes, when present, is the response-body MIME allow-list applied
+	// on top of the hosts (see sandbox.Policy.AllowedMIMETypes). The Profiler
+	// records the declared media types it observed — downloads run through
+	// the shared in-process downloader even under -profile — but omits the
+	// field entirely when any observed body lacked a parseable declared
+	// Content-Type: enforcement denies a missing Content-Type whenever a
+	// list is set, so writing one would break replaying the very script that
+	// was profiled. Hand-editing during review remains the norm. Absent means
+	// no MIME restriction; an explicit empty list denies every response body.
+	MIMETypes []string `yaml:"mime-types,omitempty"`
 }
 
 type Script struct {
@@ -78,8 +88,13 @@ func (m Manifest) Validate() error {
 		}
 	}
 	for _, host := range m.Hosts {
-		if !hostname.Valid(host) {
+		if !network.ValidHost(host) {
 			return fmt.Errorf("invalid manifest host %q", host)
+		}
+	}
+	for _, entry := range m.MIMETypes {
+		if err := sandbox.ValidateMIMERule(entry); err != nil {
+			return fmt.Errorf("manifest mime-types: %w", err)
 		}
 	}
 	return nil
@@ -142,13 +157,18 @@ func (m Manifest) Write(path string) error {
 }
 
 // Apply makes the manifest the command and host authority for cfg. Other
-// policy controls (mocks, limits, disabled commands, environment) stay intact.
+// policy controls (mocks, limits, disabled commands, environment) stay
+// intact, as does a policy's MIME allow-list unless the manifest states its
+// own.
 func (m Manifest) Apply(cfg *sandbox.Config) {
 	cfg.Strict = true
 	cfg.Allowed = command.NewSet(m.Commands...)
 	cfg.Network.AllowedPrefixes = nil
 	cfg.Network.AllowedHosts = append([]string(nil), m.Hosts...)
 	cfg.Network.GitHosts = append([]string(nil), m.Hosts...)
+	if m.MIMETypes != nil {
+		cfg.Network.AllowedMIMETypes = append([]string(nil), m.MIMETypes...)
+	}
 }
 
 // Profiler is a concurrency-safe Auditor that gathers a manifest while
@@ -156,16 +176,18 @@ func (m Manifest) Apply(cfg *sandbox.Config) {
 type Profiler struct {
 	Next sandbox.Auditor
 
-	mu       sync.Mutex
-	manifest Manifest
-	commands map[string]bool
-	hosts    map[string]bool
+	mu         sync.Mutex
+	manifest   Manifest
+	commands   map[string]bool
+	hosts      map[string]bool
+	mimeTypes  map[string]bool
+	sawUntyped bool // a download body arrived without a parseable declared type
 }
 
 func NewProfiler(name, source string, next sandbox.Auditor) *Profiler {
 	return &Profiler{
 		Next: next, manifest: New(name, source),
-		commands: map[string]bool{}, hosts: map[string]bool{},
+		commands: map[string]bool{}, hosts: map[string]bool{}, mimeTypes: map[string]bool{},
 	}
 }
 
@@ -178,6 +200,19 @@ func (p *Profiler) Audit(rec sandbox.AuditRecord) {
 		if host := resourceHost(resource); host != "" {
 			p.hosts[host] = true
 		}
+	}
+	// The in-process downloader observes what parsed argv cannot: the host of
+	// every redirect hop, and the response's declared media type.
+	for _, host := range rec.Via {
+		if host != "" {
+			p.hosts[host] = true
+		}
+	}
+	if rec.ContentType != "" {
+		p.mimeTypes[rec.ContentType] = true
+	}
+	if rec.Sniffed != "" && rec.ContentType == "" {
+		p.sawUntyped = true
 	}
 	p.mu.Unlock()
 	if p.Next != nil {
@@ -201,19 +236,25 @@ func (p *Profiler) Manifest() Manifest {
 	for host := range p.hosts {
 		m.Hosts = append(m.Hosts, host)
 	}
+	if !p.sawUntyped {
+		for mt := range p.mimeTypes {
+			m.MIMETypes = append(m.MIMETypes, mt)
+		}
+	}
 	sort.Strings(m.Commands)
 	sort.Strings(m.Hosts)
+	sort.Strings(m.MIMETypes)
 	return m
 }
 
 // resourceHost extracts the host a network-ish resource touched, with the
-// SAME parser (hostname.FromEndpoint) Policy.AllowsTarget will use when this
-// manifest is later enforced — recording and matching cannot drift apart.
+// SAME parser (network.HostFromEndpoint) Policy.AllowsTarget will use when
+// this manifest is later enforced — recording and matching cannot drift apart.
 func resourceHost(r command.Resource) string {
 	switch r.Kind {
 	case "url", "repo", "remote", "host", "socket", "keyserver":
 	default:
 		return ""
 	}
-	return hostname.FromEndpoint(r.Value)
+	return network.HostFromEndpoint(r.Value)
 }
