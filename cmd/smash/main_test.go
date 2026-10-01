@@ -1,6 +1,13 @@
 package main
 
 import (
+	"connectrpc.com/connect"
+	"context"
+	"errors"
+	approvev1 "github.com/rezen/smash/gen/smash/approve/v1"
+	"github.com/rezen/smash/gen/smash/approve/v1/approvev1connect"
+	"google.golang.org/protobuf/proto"
+	"mvdan.cc/sh/v3/interp"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -8,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	profilemanifest "github.com/rezen/smash/internal/manifest"
 	"github.com/rezen/smash/internal/policy"
@@ -57,6 +65,56 @@ func TestInitPolicyRoundTrip(t *testing.T) {
 	// not run.
 	if err := runCLI([]string{"-init-policy", filepath.Join(dir, "b.yaml"), "/nonexistent.sh"}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestInteractiveDefaultAuditIsFile(t *testing.T) {
+	dir := t.TempDir()
+	originalDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(originalDir)
+
+	input, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	if _, err := writer.WriteString("  uname -s\nexit\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	stderr, err := os.CreateTemp(dir, "stderr-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stderr.Close()
+	oldStdin, oldStderr := os.Stdin, os.Stderr
+	os.Stdin, os.Stderr = input, stderr
+	defer func() { os.Stdin, os.Stderr = oldStdin, oldStderr }()
+	if err := runCLI([]string{"-i", "-root", filepath.Join(dir, "sandbox")}); err != nil {
+		t.Fatalf("run REPL: %v", err)
+	}
+	if err := stderr.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := os.ReadFile(stderr.Name()); err != nil || len(b) != 0 {
+		t.Fatalf("default audit leaked to stderr: %q, %v", b, err)
+	}
+	logs, err := filepath.Glob(filepath.Join(dir, "smash-*.audit.yaml"))
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("default audit files = %v, %v", logs, err)
+	}
+	log, err := os.ReadFile(logs[0])
+	if err != nil || !strings.Contains(string(log), "name: uname") {
+		t.Fatalf("audit log missing command: %q, %v", log, err)
 	}
 }
 
@@ -493,4 +551,107 @@ func TestResetRootRefusesForeignDirectories(t *testing.T) {
 			t.Fatal("a root symlink must be refused")
 		}
 	})
+}
+
+func TestREPLFlags(t *testing.T) {
+	for _, args := range [][]string{{"-i", "script.sh"}, {"-mode", "invalid"}, {"-profile", "-mode", "block"}, {"-approve-timeout", "0s"}} {
+		if _, err := parseFlags(args); err == nil {
+			t.Errorf("accepted %v", args)
+		}
+	}
+	for _, args := range [][]string{{"-i"}, {"-interactive"}} {
+		fl, err := parseFlags(args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if name, _, err := resolveScriptArg(&policy.File{}, fl); err != nil || name != "" {
+			t.Fatalf("name=%q err=%v", name, err)
+		}
+	}
+}
+func TestREPLCLI(t *testing.T) {
+	dir := t.TempDir()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if _, err := w.WriteString("read x\nhello\n/usr/bin/true\nexit 7\n"); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	old := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = old }()
+	audit, err := run(t, dir, "-i")
+	if !errors.Is(err, interp.ExitStatus(7)) || !strings.Contains(audit, `name: "true"`) {
+		t.Fatalf("err=%v audit=%s", err, audit)
+	}
+}
+func TestMonitorCLI(t *testing.T) {
+	dir := t.TempDir()
+	script := write(t, dir, "s.sh", "df -h >/dev/null\n")
+	pol := write(t, dir, "p.yaml", "mode: monitor\nstrict: true\ncommands:\n  disable: df\n")
+	audit, err := run(t, dir, "-policy", pol, script)
+	if err != nil || !strings.Contains(audit, "name: df") || strings.Contains(audit, "blocked") || strings.Contains(audit, "disabled") {
+		t.Fatalf("err=%v audit=%s", err, audit)
+	}
+	_, err = run(t, dir, "-policy", pol, "-mode", "block", script)
+	if err == nil {
+		t.Fatal("typed block mode did not override policy")
+	}
+	if err := runCLI([]string{"-mode", "monitor", "-manifest", "unused", script}); err == nil {
+		t.Fatal("monitor manifest accepted")
+	}
+}
+func TestApproveStartupErrors(t *testing.T) {
+	for _, address := range []string{"bogus://server", "ws://server", "http://127.0.0.1:1"} {
+		dir := t.TempDir()
+		script := write(t, dir, "s.sh", "true\n")
+		if _, err := run(t, dir, "-approve", address, "-approve-timeout", "100ms", script); err == nil {
+			t.Errorf("accepted %s", address)
+		}
+	}
+}
+
+type denyJudge struct {
+	approvev1connect.UnimplementedApprovalServiceHandler
+}
+
+func (denyJudge) OpenSession(context.Context, *connect.Request[approvev1.OpenSessionRequest]) (*connect.Response[approvev1.OpenSessionResponse], error) {
+	return connect.NewResponse(&approvev1.OpenSessionResponse{Version: 1}), nil
+}
+func (denyJudge) Approve(context.Context, *connect.Request[approvev1.ApproveRequest]) (*connect.Response[approvev1.ApproveResponse], error) {
+	return connect.NewResponse(&approvev1.ApproveResponse{Allow: proto.Bool(false), Reason: "operator denied"}), nil
+}
+func TestApproveCLI(t *testing.T) {
+	mux := http.NewServeMux()
+	p, h := approvev1connect.NewApprovalServiceHandler(denyJudge{})
+	mux.Handle(p, h)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	dir := t.TempDir()
+	script := write(t, dir, "s.sh", "/usr/bin/true\n")
+	audit, err := run(t, dir, "-approve", server.URL, script)
+	if !errors.Is(err, interp.ExitStatus(126)) || !strings.Contains(audit, "served: approve") || !strings.Contains(audit, "operator denied") {
+		t.Fatalf("err=%v audit=%s", err, audit)
+	}
+}
+func TestApprovalPolicyPrecedence(t *testing.T) {
+	pol, err := policy.Parse([]byte("mode: monitor\napprove:\n  url: https://example.com\n  timeout: 20s\n  headers:\n    Authorization: literal\n"), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fl, err := parseFlags([]string{"-i", "-mode", "block", "-approve", "prompt", "-approve-timeout", "10s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	address, duration, headers := approvalSettings(pol, fl)
+	if address != "prompt" || duration != 10*time.Second || headers.Get("Authorization") != "literal" {
+		t.Fatalf("%s %v %v", address, duration, headers)
+	}
+	cfg, err := buildConfig(pol, fl, t.TempDir(), nil, nil)
+	if err != nil || cfg.Profile || !cfg.Interactive || cfg.Timeout != 0 {
+		t.Fatalf("cfg=%+v err=%v", cfg, err)
+	}
 }

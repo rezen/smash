@@ -142,6 +142,75 @@ type gate struct {
 	interpret              scriptRunner
 }
 
+// Verdict describes the command gate's local decision, without executing it.
+type Verdict string
+
+const (
+	VerdictAllowed           Verdict = "allowed"
+	VerdictUnlisted          Verdict = "unlisted"
+	VerdictSensitiveBlocked  Verdict = "sensitive-blocked"
+	VerdictStrictBlocked     Verdict = "strict-blocked"
+	VerdictDisabledBlocked   Verdict = "disabled-blocked"
+	VerdictInRootScript      Verdict = "in-root-script"
+	VerdictInRootInterpreter Verdict = "in-root-interpreter"
+	VerdictInRootNative      Verdict = "in-root-native"
+)
+
+func (v Verdict) String() string { return string(v) }
+
+// judge returns the verdict and the resolved path, when there is one. It
+// inspects shebangs as well as command names, exactly as the execution gate does.
+func (g gate) judge(hc interp.HandlerContext, args []string) (Verdict, string) {
+	if len(args) == 0 {
+		return VerdictAllowed, ""
+	}
+	if path := resolveInSandbox(hc, g.root, args[0]); path != "" {
+		via, shebang := shell.InterpreterFromFile(path)
+		name := filepath.Base(via)
+		if !shebang {
+			return VerdictInRootNative, path
+		}
+		if g.denied[name] {
+			return VerdictDisabledBlocked, path
+		}
+		registry := g.registry
+		if registry == nil {
+			registry = command.Default
+		}
+		if _, ok := registry.Lookup(name).(command.ScriptRunner); ok && g.interpret != nil {
+			return VerdictInRootScript, path
+		}
+		if g.allowed[name] {
+			return VerdictInRootInterpreter, path
+		}
+		if g.sensitive[name] {
+			return VerdictSensitiveBlocked, path
+		}
+		if g.strict {
+			return VerdictStrictBlocked, path
+		}
+		return VerdictInRootInterpreter, path
+	}
+	name := filepath.Base(args[0])
+	if g.allowed[name] {
+		return VerdictAllowed, g.allowedPaths[name]
+	}
+	if g.sensitive[name] {
+		return VerdictSensitiveBlocked, ""
+	}
+	if g.strict {
+		return VerdictStrictBlocked, ""
+	}
+	return VerdictUnlisted, ""
+}
+
+func configGate(cfg Config) gate {
+	return gate{registry: cfg.Commands, root: cfg.Root, allowed: cfg.Allowed,
+		sensitive: cfg.Sensitive, denied: cfg.Denied, strict: cfg.Strict,
+		allowInRootExecutables: cfg.AllowInRootExecutables,
+		allowedPaths:           resolveAllowedPaths(cfg), interpret: confinedScriptRunner(cfg)}
+}
+
 // allowListMiddleware is the command gate described at the top of this file,
 // delegating to the real (os/exec-backed) default handler when a command may
 // run. The three sets are consulted by command name (a path is reduced to its
@@ -153,23 +222,21 @@ func allowListMiddleware(g gate) Middleware {
 				return next(ctx, args)
 			}
 			hc := interp.HandlerCtx(ctx)
-			if path := resolveInSandbox(hc, g.root, args[0]); path != "" {
+			verdict, path := g.judge(hc, args)
+			if path != "" && verdict != VerdictAllowed {
 				return g.runFromRoot(ctx, next, hc, path, args)
 			}
-			allowed, sensitive, strict := g.allowed, g.sensitive, g.strict
-			name := filepath.Base(args[0])
-			switch {
-			case allowed[name]:
-				path := g.allowedPaths[name]
+			switch verdict {
+			case VerdictAllowed:
 				if path == "" {
 					return failf(hc.Stderr, 127, "%s: command not found on the configured PATH", args[0])
 				}
 				trusted := append([]string(nil), args...)
 				trusted[0] = path // do not let a script shadow an allowed name via PATH
 				return next(ctx, trusted)
-			case sensitive[name]:
+			case VerdictSensitiveBlocked:
 				return failf(hc.Stderr, 127, "[sandbox] blocked command: %s (sensitive; allow-list it to permit)", args[0])
-			case strict:
+			case VerdictStrictBlocked:
 				return failf(hc.Stderr, 127, "[sandbox] blocked command: %s", args[0])
 			}
 			// Unlisted: not interesting enough to refuse, interesting enough to

@@ -51,6 +51,8 @@ internal/sandbox/   the enforcement stack on mvdan/sh
   sandbox.go    Config, NewConfig, Run, buildRunner
   audit.go      AuditRecord, Auditor, TextAuditor, stdin/stdout capture (Config.Auditor/AuditData)
   control.go    Disable (deny-list) and Mock + Matchers (canned stdout/stderr/exit)
+  session.go    persistent runner with per-batch timeout and state access
+  approve.go    approval interface, gate verdict preflight, session decision cache
   allowlist.go  DefaultAllowList + DefaultSensitiveList + the command gate (unlisted runs audited; Strict) / in-sandbox escape hatch, shebang-aware
   middleware.go unwrap (+ the wrapper chain for the audit record), sudo-probe grant, git-version probe, sleep cap
   iterate.go    find/xargs item collection and confined inner invocations
@@ -100,3 +102,16 @@ internal/tool/   portable in-process command implementations
   sha256sum.go   SHA-256 generation and checksum verification
   tool.go        tool discovery and shared failures
 ```
+
+## Interactive and approval packages
+
+- `internal/repl/repl.go`: line source, incremental parsing, terminal restoration,
+  cancellation, and exit status; `repl_test.go` covers shared stdin and interrupts.
+- `internal/approve/`: Connect RPC lifecycle (`connect.go`), explicit protobuf
+  conversion (`protocol.go`), async audit stream (`audit.go`), and serialized
+  terminal confirmation (`prompt.go`).
+- `proto/smash/approve/v1/approve.proto`: public versioned approval service.
+- `gen/smash/approve/v1/`: checked-in generated protobuf and Connect bindings.
+- `buf.yaml`, `buf.gen.yaml`: schema and pinned generation settings.
+- `tools/approver/main.go`: local reference Connect server.
+- `cmd/smash/approve.go`: policy/flag precedence and approver lifecycle wiring.

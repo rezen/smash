@@ -25,12 +25,15 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/rezen/smash/internal/repl"
 	"mvdan.cc/sh/v3/expand"
+	"mvdan.cc/sh/v3/interp"
 
 	profilemanifest "github.com/rezen/smash/internal/manifest"
 	"github.com/rezen/smash/internal/network"
@@ -43,6 +46,9 @@ func main() {
 	if err := runCLI(os.Args[1:]); err != nil {
 		if errors.Is(err, splitview.ErrInterrupted) {
 			os.Exit(130)
+		}
+		if code, ok := errors.AsType[interp.ExitStatus](err); ok {
+			os.Exit(int(code))
 		}
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
@@ -66,6 +72,29 @@ func main() {
 // rather than off their values — -strict=false and an absent -strict have the
 // same value and must not have the same effect. Each helper owns one such
 // precedence decision end to end: resolveScriptArg the script+args unit,
+func effectiveMode(pol *policy.File, fl *cliFlags) (string, error) {
+	mode := "block"
+	if pol.Mode != nil {
+		mode = *pol.Mode
+	}
+	if fl.set["mode"] {
+		mode = fl.mode
+	}
+	if mode != "block" && mode != "monitor" {
+		return "", fmt.Errorf("mode must be block or monitor")
+	}
+	if fl.profile {
+		if fl.set["mode"] && fl.mode == "block" {
+			return "", fmt.Errorf("-profile conflicts with -mode block")
+		}
+		mode = "monitor"
+	}
+	if fl.manifestPath != "" && mode != "block" {
+		return "", fmt.Errorf("-manifest requires block mode")
+	}
+	return mode, nil
+}
+
 // effectiveDNS the resolver, buildConfig the Config layering, wireAudit the
 // audit sink.
 func runCLI(argv []string) error {
@@ -91,18 +120,25 @@ func runCLI(argv []string) error {
 		}
 		pol = p
 	}
+	if _, err := effectiveMode(pol, fl); err != nil {
+		return err
+	}
 	scriptArg, scriptArgs, err := resolveScriptArg(pol, fl)
 	if err != nil {
 		return err
 	}
-	scriptClient, err := network.NewHTTPClient(60*time.Second, effectiveDNS(pol, fl))
-	if err != nil {
-		return err
+	name, script := "repl", ""
+	if !fl.interactive {
+		scriptClient, err := network.NewHTTPClient(60*time.Second, effectiveDNS(pol, fl))
+		if err != nil {
+			return err
+		}
+		name, script, err = loadScript(scriptArg, scriptClient)
+		if err != nil {
+			return err
+		}
 	}
-	name, script, err := loadScript(scriptArg, scriptClient)
-	if err != nil {
-		return err
-	}
+
 	if fl.profile && fl.profileOutput == "" {
 		fl.profileOutput = defaultManifestPath(name)
 	}
@@ -132,11 +168,18 @@ func runCLI(argv []string) error {
 	if err != nil {
 		return err
 	}
+	// Connect before starting a terminal UI; prompt approval uses the real tty.
+	closeApprover, err := wireApprover(pol, fl, &cfg)
+	if err != nil {
+		return err
+	}
+	defer closeApprover()
 	view, cleanup, err := wireAudit(pol, fl, &cfg)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
+	attachApproverAudit(&cfg)
 
 	var profiler *profilemanifest.Profiler
 	var profileLog string
@@ -161,7 +204,31 @@ func runCLI(argv []string) error {
 		cfg.Auditor = profiler
 	}
 	var runErr error
-	if view != nil {
+	if fl.interactive {
+		session, err := sandbox.NewSession(cfg)
+		if err != nil {
+			return err
+		}
+		interrupts := make(chan os.Signal, 8)
+		signal.Notify(interrupts, os.Interrupt)
+		defer signal.Stop(interrupts)
+		mode, _ := effectiveMode(pol, fl)
+		tag := mode
+		address, _, _ := approvalSettings(pol, fl)
+		if address == "prompt" {
+			tag += " ask"
+		} else if address != "" {
+			tag += " rpc"
+		}
+		code, err := repl.Run(context.Background(), repl.Options{Session: session, Stdin: cfg.Stdin, Stdout: cfg.Stdout, Stderr: cfg.Stderr, Prompt: "smash[" + tag + "]$ ", Interrupts: interrupts})
+		if err != nil {
+			return err
+		}
+		if code != 0 {
+			return interp.ExitStatus(code)
+		}
+		return nil
+	} else if view != nil {
 		runErr = view.Run(func(ctx context.Context) error {
 			return sandbox.RunContext(ctx, cfg, name, script)
 		})
@@ -185,23 +252,27 @@ func runCLI(argv []string) error {
 // off it, because a flag's zero value and an absent flag must not have the
 // same effect.
 type cliFlags struct {
-	policyPath    string
-	initPolicy    string
-	profile       bool
-	profileOutput string
-	manifestPath  string
-	urls          string
-	urlsGitHub    bool
-	gitHosts      string
-	dnsServer     string
-	allow         string
-	disable       string
-	strict        bool
-	allowSudo     bool
-	allowInRoot   bool
-	audit         string
-	data          int
-	root          string
+	interactive    bool
+	mode           string
+	approve        string
+	approveTimeout time.Duration
+	policyPath     string
+	initPolicy     string
+	profile        bool
+	profileOutput  string
+	manifestPath   string
+	urls           string
+	urlsGitHub     bool
+	gitHosts       string
+	dnsServer      string
+	allow          string
+	disable        string
+	strict         bool
+	allowSudo      bool
+	allowInRoot    bool
+	audit          string
+	data           int
+	root           string
 
 	scriptGiven bool     // a positional argument was present, even an empty one
 	script      string   // the first positional argument
@@ -212,6 +283,11 @@ type cliFlags struct {
 func parseFlags(argv []string) (*cliFlags, error) {
 	fl := &cliFlags{}
 	fs := flag.NewFlagSet("smash", flag.ContinueOnError)
+	fs.BoolVar(&fl.interactive, "i", false, "read commands interactively from stdin")
+	fs.BoolVar(&fl.interactive, "interactive", false, "read commands interactively from stdin")
+	fs.StringVar(&fl.mode, "mode", "block", "run mode: block or monitor (observe without local enforcement)")
+	fs.StringVar(&fl.approve, "approve", "", "external judge: prompt or http:// / https:// Connect base URL")
+	fs.DurationVar(&fl.approveTimeout, "approve-timeout", 60*time.Second, "time allowed for each approval decision")
 	fs.StringVar(&fl.policyPath, "policy", "", "read the run's policy from a YAML file; flags given here override it (see -init-policy)")
 	fs.StringVar(&fl.initPolicy, "init-policy", "", "write a commented boilerplate policy file here (\"-\" = stdout) and exit")
 	fs.BoolVar(&fl.profile, "profile", false, "run the script and write its SHA-256 plus observed commands and hosts to a manifest")
@@ -238,6 +314,18 @@ func parseFlags(argv []string) (*cliFlags, error) {
 		fl.scriptGiven = true
 		fl.script, fl.args = fs.Arg(0), fs.Args()[1:]
 	}
+	if fl.mode != "block" && fl.mode != "monitor" {
+		return nil, fmt.Errorf("-mode must be block or monitor")
+	}
+	if fl.approveTimeout <= 0 {
+		return nil, fmt.Errorf("-approve-timeout must be positive")
+	}
+	if fl.interactive && fl.scriptGiven {
+		return nil, fmt.Errorf("-i does not accept a script positional")
+	}
+	if fl.profile && fl.set["mode"] && fl.mode == "block" {
+		return nil, fmt.Errorf("-profile conflicts with -mode block")
+	}
 	return fl, nil
 }
 
@@ -246,6 +334,15 @@ func parseFlags(argv []string) (*cliFlags, error) {
 // its args, so a new script does not silently inherit arguments meant for the
 // old one.
 func resolveScriptArg(pol *policy.File, fl *cliFlags) (script string, args []string, err error) {
+	if fl.interactive {
+		if fl.scriptGiven {
+			return "", nil, fmt.Errorf("-i does not accept a script positional")
+		}
+		if fl.manifestPath != "" || fl.profile {
+			return "", nil, fmt.Errorf("-i cannot be combined with -manifest or -profile; use -mode monitor to observe a session")
+		}
+		return "", nil, nil
+	}
 	script, args = pol.Script, pol.Args
 	if fl.scriptGiven {
 		script, args = fl.script, fl.args
@@ -267,7 +364,7 @@ func resolveScriptArg(pol *policy.File, fl *cliFlags) (script string, args []str
 // buildConfig.
 func effectiveDNS(pol *policy.File, fl *cliFlags) string {
 	switch {
-	case fl.profile:
+	case fl.profile || fl.mode == "monitor" || (!fl.set["mode"] && pol.Mode != nil && *pol.Mode == "monitor"):
 		return network.DefaultDNSServer
 	case fl.set["dns-server"]:
 		return fl.dnsServer
@@ -300,6 +397,10 @@ func buildConfig(pol *policy.File, fl *cliFlags, rootAbs string, scriptArgs []st
 	// Keep the caller's terminal attached so interactive installers can use
 	// shell reads and external command prompts.
 	cfg.Stdin = os.Stdin
+	cfg.Interactive = fl.interactive
+	if fl.interactive {
+		cfg.Timeout = 0
+	}
 	cfg.Args = scriptArgs
 	if err := pol.Apply(&cfg); err != nil {
 		return sandbox.Config{}, err
@@ -335,13 +436,18 @@ func buildConfig(pol *policy.File, fl *cliFlags, rootAbs string, scriptArgs []st
 	if set["allow-in-root"] {
 		cfg.AllowInRootExecutables = fl.allowInRoot
 	}
-	if fl.profile {
-		cfg.Profile = true
+	mode, err := effectiveMode(pol, fl)
+	if err != nil {
+		return sandbox.Config{}, err
+	}
+	cfg.Profile = mode == "monitor"
+	if fl.set["approve-timeout"] {
+		cfg.ApproveTimeout = fl.approveTimeout
 	}
 	if runManifest != nil {
 		runManifest.Apply(&cfg)
 	}
-	if !fl.profile {
+	if !cfg.Profile {
 		if err := cfg.Network.Validate(); err != nil {
 			return sandbox.Config{}, err
 		}
@@ -356,9 +462,11 @@ func buildConfig(pol *policy.File, fl *cliFlags, rootAbs string, scriptArgs []st
 // started, so the caller runs the script through it, and a cleanup to defer.
 func wireAudit(pol *policy.File, fl *cliFlags, cfg *sandbox.Config) (*splitview.View, func(), error) {
 	audit, dataBytes := fl.audit, fl.data
+	defaultREPLAudit := fl.interactive && !fl.set["audit"]
 	if a := pol.Audit; a != nil {
 		if !fl.set["audit"] && a.Path != nil {
 			audit = *a.Path
+			defaultREPLAudit = false
 		}
 		if !fl.set["data"] && a.Data != nil {
 			dataBytes = *a.Data
@@ -369,6 +477,20 @@ func wireAudit(pol *policy.File, fl *cliFlags, cfg *sandbox.Config) (*splitview.
 	switch audit {
 	case "":
 	case "-":
+		if defaultREPLAudit {
+			f, err := createREPLAudit()
+			if err != nil {
+				return nil, cleanup, err
+			}
+			cfg.Auditor = sandbox.TextAuditor(f, sandbox.ShortPaths(*cfg))
+			cleanup = func() { f.Close() }
+			break
+		}
+		address, _, _ := approvalSettings(pol, fl)
+		if fl.interactive || address == "prompt" {
+			cfg.Auditor = sandbox.TextAuditor(os.Stderr, sandbox.ShortPaths(*cfg))
+			break
+		}
 		view, ok, err := splitview.Start(os.Stdin, os.Stdout, os.Stderr)
 		if err != nil {
 			return nil, cleanup, err
@@ -390,6 +512,21 @@ func wireAudit(pol *policy.File, fl *cliFlags, cfg *sandbox.Config) (*splitview.
 		cleanup = func() { f.Close() }
 	}
 	return nil, cleanup, nil
+}
+
+func createREPLAudit() (*os.File, error) {
+	base := "smash-" + time.Now().Format("20060102-150405.000000000") + ".audit.yaml"
+	for i := 0; ; i++ {
+		name := base
+		if i > 0 {
+			name = fmt.Sprintf("%s-%d", strings.TrimSuffix(base, ".audit.yaml"), i) + ".audit.yaml"
+		}
+		f, err := os.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if errors.Is(err, fs.ErrExist) {
+			continue
+		}
+		return f, err
+	}
 }
 
 // manifestLogPath is the audit-log companion of a manifest path:

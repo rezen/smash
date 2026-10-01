@@ -5,6 +5,7 @@ package sandbox
 // change here rather than a silent one in buildRunner.
 
 import (
+	"context"
 	"os"
 	"slices"
 	"testing"
@@ -16,6 +17,7 @@ import (
 func everythingOnConfig(t *testing.T) Config {
 	t.Helper()
 	cfg := NewConfig(t.TempDir(), ".", expand.ListEnviron("PATH=/usr/bin:/bin"))
+	cfg.Approver = ApproverFunc(func(context.Context, ApprovalRequest) (Decision, error) { return Decision{Allow: true}, nil })
 	cfg.Auditor = AuditorFunc(func(AuditRecord) {})
 	cfg.Disable("frobnicate")
 	cfg.AllowSudo = true
@@ -37,7 +39,7 @@ func layerNames(t *testing.T, cfg Config) []string {
 func TestExecLayerOrdering(t *testing.T) {
 	names := layerNames(t, everythingOnConfig(t))
 	want := []string{
-		"unwrap", "audit", "iterate", "deny", "sudo-grant", "mock",
+		"unwrap", "audit", "iterate", "deny", "sudo-grant", "mock", "approve",
 		"git-version", "sleep-cap",
 		"sh-interp", "tool-mktemp", "tool-sha256sum", "tool-base64", "uname",
 		"http", "egress", "gate", "tty",
@@ -61,6 +63,8 @@ func TestExecLayerOrdering(t *testing.T) {
 	mustPrecede("audit", "deny", "the audit record must carry the true outcome of every enforcement layer")
 	mustPrecede("deny", "sudo-grant", "-disable sudo must beat AllowSudo's grant")
 	mustPrecede("deny", "mock", "a disabled command cannot be mocked back to life")
+	mustPrecede("approve", "http", "a denied download must never open a socket")
+	mustPrecede("mock", "approve", "a mocked command is not asked about")
 	mustPrecede("mock", "http", "a mocked curl must never touch the network")
 	mustPrecede("http", "egress", "curl/wget are served in-process before the generic egress guard")
 	mustPrecede("egress", "gate", "network-capable commands are judged by intent before the name gate runs them")
@@ -76,7 +80,7 @@ func TestProfileModeLayers(t *testing.T) {
 	cfg.Profile = true
 	names := layerNames(t, cfg)
 	want := []string{
-		"unwrap", "audit", "iterate", "sudo-grant",
+		"unwrap", "audit", "iterate", "sudo-grant", "approve",
 		"sh-interp", "tool-mktemp", "tool-sha256sum", "tool-base64", "uname", "http", "tty",
 	}
 	if !slices.Equal(names, want) {

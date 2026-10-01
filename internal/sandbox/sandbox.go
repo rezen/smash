@@ -80,8 +80,11 @@ type Config struct {
 	// Every other external command and network client runs directly; use only
 	// with separate OS confinement or a script trusted enough to execute
 	// unrestricted.
-	Profile  bool
-	Commands *command.Registry // nil uses command.Default
+	Profile        bool
+	Interactive    bool              // enable interactive shell features, including aliases
+	Approver       Approver          // optional external command approval
+	ApproveTimeout time.Duration     // per-decision bound; zero = 60s
+	Commands       *command.Registry // nil uses command.Default
 
 	// AllowSudo answers sudo/doas credential probes (`sudo -v`, `sudo -n -l
 	// mkdir`, `sudo -K`) as if the user had passwordless sudo, so an installer
@@ -184,15 +187,22 @@ func prepareRun(cfg Config, name, src string) (Config, *interp.Runner, *syntax.F
 	if err != nil {
 		return cfg, nil, nil, err
 	}
+	cfg, runner, err := prepareRunner(cfg)
+	return cfg, runner, prog, err
+}
+
+// prepareRunner is shared by scripts and persistent sessions. Build the stack
+// once so nested runners share its policy snapshots and decision cache.
+func prepareRunner(cfg Config) (Config, *interp.Runner, error) {
+	if cfg.Commands == nil {
+		cfg.Commands = command.Default
+	}
 	cfg.stack = &execStack{}
 	if _, err := execLayers(cfg); err != nil {
-		return cfg, nil, nil, err
+		return cfg, nil, err
 	}
 	runner, err := buildRunner(cfg)
-	if err != nil {
-		return cfg, nil, nil, err
-	}
-	return cfg, runner, prog, nil
+	return cfg, runner, err
 }
 
 // parseBash parses a script with the bash dialect and applies the
@@ -372,6 +382,9 @@ func execLayers(cfg Config) (*execStack, error) {
 	if enforcing && len(cfg.Mocks) > 0 {
 		s.add("mock", mockMiddleware(cfg.Mocks))
 	}
+	if cfg.Approver != nil {
+		s.add("approve", approveMiddleware(cfg))
+	}
 	if enforcing {
 		s.add("git-version", gitVersionMiddleware(resolveHostCommandPath(cfg, "git")))
 		s.add("sleep-cap", sleepCapMiddleware(time.Second/5))
@@ -390,14 +403,7 @@ func execLayers(cfg Config) (*execStack, error) {
 		}
 		s.add("http", httpMW)
 		s.add("egress", egressGuardMiddleware(cfg.Network))
-		s.add("gate", allowListMiddleware(gate{
-			registry: cfg.Commands,
-			root:     cfg.Root, allowed: cfg.Allowed, sensitive: cfg.Sensitive,
-			denied: cfg.Denied, strict: cfg.Strict,
-			allowInRootExecutables: cfg.AllowInRootExecutables,
-			allowedPaths:           resolveAllowedPaths(cfg),
-			interpret:              confinedScriptRunner(cfg),
-		}))
+		s.add("gate", allowListMiddleware(configGate(cfg)))
 	} else {
 		httpMW, err := observeHTTPMiddleware(cfg.Network, cfg.Root)
 		if err != nil {
@@ -441,6 +447,7 @@ func buildRunner(cfg Config) (*interp.Runner, error) {
 		interp.Env(bashEnviron{Environ: cfg.Env, posix: cfg.Posix, ostype: osType(e.UnameOS)}),
 		interp.Dir(cfg.Dir),
 		interp.IgnoreErrexit(cfg.Profile),
+		interp.Interactive(cfg.Interactive),
 		interp.StdIO(cfg.Stdin, cfg.Stdout, cfg.Stderr),
 		interp.ExecHandlers(stack.mws...),
 		interp.CallHandler(detectionCallHandler),

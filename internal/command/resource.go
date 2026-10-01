@@ -26,9 +26,9 @@ import (
 
 // Resource is one thing an invocation interacts with.
 type Resource struct {
-	Kind   string // url, host, path, repo, image, database, mode, script, operand, …
-	Action string // fetch, connect, read, write, modify, apply, run, … ("" = unspecified)
-	Value  string
+	Kind   string `json:"kind"`   // url, host, path, repo, image, database, mode, script, operand, …
+	Action string `json:"action"` // fetch, connect, read, write, modify, apply, run, … ("" = unspecified)
+	Value  string `json:"value"`
 }
 
 func (r Resource) String() string {

@@ -56,10 +56,9 @@ fmt-check:
 vet: _ensure-sh
     go vet ./...
 
-# Fail if go.mod / go.sum are not tidy.
+# Fail if go.mod / go.sum are not tidy (including uncommitted dependency changes).
 tidy-check: _ensure-sh
-    go mod tidy
-    git diff --exit-code -- go.mod go.sum
+    go mod tidy -diff
 
 # Run staticcheck.
 lint: _ensure-sh
@@ -84,6 +83,8 @@ dist version=`git describe --tags --always --dirty`: _ensure-sh
     # The doubled opening braces are just's escape for the one brace pair
     # go's -f template needs.
     yaml_license="$(go list -m -f '{{{{.Dir}}' gopkg.in/yaml.v3)/LICENSE"
+    connect_license="$(go list -m -f '{{{{.Dir}}' connectrpc.com/connect)/LICENSE"
+    protobuf_license="$(go list -m -f '{{{{.Dir}}' google.golang.org/protobuf)/LICENSE"
     for target in {{release_targets}}; do
         goos=${target%/*}; goarch=${target#*/}
         name="smash_{{version}}_${goos}_${goarch}"
@@ -94,6 +95,8 @@ dist version=`git describe --tags --always --dirty`: _ensure-sh
         cp README.md "dist/$name/"
         cp third_party/sh/LICENSE "dist/$name/LICENSE.mvdan-sh"
         cp "$yaml_license" "dist/$name/LICENSE.yaml.v3"
+        cp "$connect_license" "dist/$name/LICENSE.connect"
+        cp "$protobuf_license" "dist/$name/LICENSE.protobuf"
         tar -C dist -czf "dist/$name.tar.gz" "$name"
     done
     (cd dist && shasum -a 256 *.tar.gz > checksums.txt && cat checksums.txt)

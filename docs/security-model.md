@@ -272,3 +272,19 @@ processes at the OS or virtualization layer:
 These layers complement `smash`: the OS boundary limits consequences, while
 the command and resource model provides installer-specific policy, mocks, and
 an intelligible audit trail.
+
+## Interactive monitoring and approval
+
+`-mode monitor` is discovery, not confinement: it selects the same observation
+stack as profiling without emitting a manifest. Local command/egress gates,
+mocks, and sleep caps are disabled. The downloader retains its existing observe
+configuration. Interactive mode has the same soft boundary and root reset as
+script execution.
+
+An external approver can only narrow what local policy permits. A denial,
+missing decision field, timeout, malformed response, or unreachable supervisor
+fails closed. Failed startup negotiation prevents execution; transport failures
+invalidate the session without retrying. Shell builtins and shell opens are not
+approval-gated. Server reasons are escaped before terminal output. Connect RPC
+uses normal HTTPS certificate verification and authentication headers; see
+[approval](approver.md) for caching scope and audit behavior.

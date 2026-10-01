@@ -40,10 +40,10 @@ const (
 
 // FileChange is one filesystem change an invocation makes.
 type FileChange struct {
-	Op        FileOp
-	Path      string // the path changed (the destination for move/copy/link)
-	From      string // the source for move/copy/link/extract
-	Recursive bool
+	Op        FileOp `json:"op"`
+	Path      string `json:"path"`           // the path changed (the destination for move/copy/link)
+	From      string `json:"from,omitempty"` // the source for move/copy/link/extract
+	Recursive bool   `json:"recursive,omitempty"`
 }
 
 func (c FileChange) String() string {

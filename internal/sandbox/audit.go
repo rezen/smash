@@ -306,7 +306,7 @@ func (t *textAuditor) Audit(r AuditRecord) {
 	if r.Reason != "" {
 		rec.add("reason", t.scalar(r.Reason))
 	}
-	if r.Served != "" && r.Reason == "" && r.Served != "gate" {
+	if r.Served != "" && (r.Reason == "" || r.Served == "approve") && r.Served != "gate" {
 		rec.add("served", t.scalar(r.Served))
 	}
 	if r.ContentType != "" {

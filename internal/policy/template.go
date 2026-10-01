@@ -50,6 +50,17 @@ const Template = `# smash policy — everything one run needs, in one file.
 # only the sensitive list is enforced.
 #strict: false
 
+# Local enforcement: block or monitor (observe only).
+#mode: block
+
+# External command approval; headers are literal (no environment expansion).
+#approve:
+#  url: prompt  # or https://approver.example
+#  timeout: 60s
+#  headers:
+#    Authorization: Bearer literal-token
+# SMASH_APPROVE_TOKEN supplies a bearer header when none is configured.
+
 # Permit native executables installed below root. Native code runs outside the
 # in-process command and network model, so this is an explicit unsafe grant.
 # Shell scripts below root are still interpreted confined without this.
@@ -63,7 +74,7 @@ const Template = `# smash policy — everything one run needs, in one file.
 # Run the script as sh rather than bash (also implied by a '#!/bin/sh' shebang).
 #posix: false
 
-# Wall-time bound for the whole run.
+# Wall-time bound for a script, or each interactive batch (REPL default: none).
 #timeout: 2m
 
 # ------------------------------------------------------------------ audit ---

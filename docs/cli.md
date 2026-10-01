@@ -4,7 +4,8 @@ The `smash` CLI runs a local or remote shell script under a command, network,
 filesystem-environment, and audit policy.
 
 ```text
-smash [flags] SCRIPT|URL [ARGS…]
+smash [-mode block|monitor] [-approve URL|prompt] [flags] SCRIPT|URL [ARGS…]
+smash -i [-mode block|monitor] [-approve URL|prompt] [flags]
 smash -policy FILE [flags] [SCRIPT [ARGS…]]
 smash -profile [flags] SCRIPT|URL [ARGS…]
 smash -manifest FILE [flags] SCRIPT|URL [ARGS…]
@@ -52,10 +53,55 @@ The split is disabled automatically if any standard stream is redirected,
 input is piped, `$TERM` is empty or `dumb`, the terminal is too small, or the
 audit target is a file or disabled.
 
+## Interactive mode
+
+```bash
+smash -i
+smash -i -mode monitor -audit session.yaml
+smash -i -approve prompt
+smash -i -approve https://approver.example
+printf 'read x\nhello\necho got:$x\n' | smash -i
+```
+
+Variables, aliases, functions, shell options, and cwd persist across commands.
+A terminal gets `smash[block]$ ` (or `monitor`, plus `ask`/`rpc` when approval is
+active); unfinished statements get `> `. Pipes and files get no prompts.
+The parser reads one line at a time, leaving subsequent input for shell `read`
+and external commands. Ctrl-C cancels the current command or discards unfinished
+input; Ctrl-D exits with the last status. `exit N` returns N.
+
+The REPL uses plain terminal output. By default, its audit stream is saved to
+a unique `smash-*.audit.yaml` file in the current directory. `-audit -` writes
+YAML to stderr, and `-audit ''` disables the stream. The split view is never
+started. Prompt approval also disables the split view for
+script runs so `/dev/tty` belongs to the operator. Cooked terminal editing
+(backspace, Ctrl-U) works; built-in history and line editing are not included.
+`rlwrap smash -i` can supply history. The root is cleared at session startup,
+with HOME/TMPDIR/PATH configured as for scripts. A policy `timeout` bounds each
+batch; without it, interactive batches have no deadline.
+
+Monitor mode uses the same observation stack as `-profile`, without writing a
+manifest: local command and egress enforcement, mocks, and sleep caps are off,
+and `set -e` termination is ignored. The existing in-process downloader still
+uses its observe configuration and root-scoped output. An installed approver
+can deny commands in either mode. See [the approval protocol](approver.md).
+
+Conflicts:
+
+- `-i` rejects script positionals and cannot combine with `-profile` or
+  `-manifest`; use `-mode monitor` to observe interactive work.
+- `-profile` implies monitor; explicit `-profile -mode block` is an error.
+- `-manifest` requires block mode.
+- `-mode` accepts only `block` and `monitor`.
+
 ## Flags
 
 | Flag | Default | Meaning |
 |---|---:|---|
+| `-i`, `-interactive` | false | Read commands from stdin in a persistent interactive shell |
+| `-mode block\|monitor` | `block` | Enforce local policy, or observe without local command/network enforcement |
+| `-approve URL\|prompt` | — | Ask a Connect RPC server at an HTTP(S) base URL, or ask on `/dev/tty` |
+| `-approve-timeout D` | `60s` | Bound startup and each approval decision; expiry denies |
 | `-policy FILE` | — | Read the base configuration from a YAML policy file |
 | `-init-policy FILE` | — | Write a commented policy template and exit; `-` writes to stdout |
 | `-profile` | false | Run and write the script SHA-256 plus observed host processes, GitHub owner/repo URL prefixes, hosts (redirect hops included), and response media types to a manifest |
@@ -70,7 +116,7 @@ audit target is a file or disabled.
 | `-strict` | false | Deny every command not on the allow-list |
 | `-allow-sudo` | false | Make sudo/doas credential probes succeed; commands still run without escalation |
 | `-allow-in-root` | false | Permit native executables below the run root; this explicitly leaves in-process enforcement |
-| `-audit FILE\|-` | `-` | Write the audit stream to a file or stderr; an empty value disables it |
+| `-audit FILE\|-` | `-` (REPL: file) | Write the audit stream to a file or stderr; an empty value disables it |
 | `-data N` | 0 | Capture at most `N` bytes each of command stdin and pipe or file stdout; terminal-facing stdout remains attached to the PTY |
 | `-root DIR` | `sandbox` | Recreated directory used for the run's `HOME`, `TMPDIR`, and leading `PATH` |
 

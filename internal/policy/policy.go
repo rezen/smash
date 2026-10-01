@@ -35,6 +35,9 @@ type File struct {
 	Script string   `yaml:"script"`
 	Args   []string `yaml:"args"`
 
+	Mode    *string   `yaml:"mode"`
+	Approve *Approval `yaml:"approve"`
+
 	Strict      *bool     `yaml:"strict"`
 	AllowSudo   *bool     `yaml:"allow-sudo"`
 	AllowInRoot *bool     `yaml:"allow-in-root"`
@@ -48,6 +51,13 @@ type File struct {
 	Network   *Network   `yaml:"network"`
 	Emulation *Emulation `yaml:"emulation"`
 	Mocks     []Mock     `yaml:"mocks"`
+}
+
+// Approval configures the external judge. The CLI owns its connection lifecycle.
+type Approval struct {
+	URL     string            `yaml:"url"`
+	Timeout *Duration         `yaml:"timeout"`
+	Headers map[string]string `yaml:"headers"`
 }
 
 // Audit controls where the audit trail goes and how much of each command's
@@ -144,6 +154,12 @@ func Parse(b []byte, name string) (*File, error) {
 }
 
 func (f *File) validate() error {
+	if f.Mode != nil && *f.Mode != "block" && *f.Mode != "monitor" {
+		return fmt.Errorf("mode must be block or monitor")
+	}
+	if f.Approve != nil && f.Approve.Timeout != nil && *f.Approve.Timeout <= 0 {
+		return fmt.Errorf("approve.timeout must be positive")
+	}
 	for i, m := range f.Mocks {
 		if m.Match.empty() {
 			return fmt.Errorf("mocks[%d]: needs at least one of name, args, prefix, glob, resource", i)
@@ -166,6 +182,12 @@ func (m Match) empty() bool {
 func (f *File) Apply(cfg *sandbox.Config) error {
 	if f == nil {
 		return nil
+	}
+	if f.Mode != nil {
+		cfg.Profile = *f.Mode == "monitor"
+	}
+	if f.Approve != nil && f.Approve.Timeout != nil {
+		cfg.ApproveTimeout = time.Duration(*f.Approve.Timeout)
 	}
 	setBool(&cfg.Strict, f.Strict)
 	setBool(&cfg.AllowSudo, f.AllowSudo)

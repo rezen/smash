@@ -41,8 +41,8 @@ const (
 
 // Egress is one classified egress: where (or what) plus which kind of where.
 type Egress struct {
-	Target string
-	Kind   EgressKind
+	Target string     `json:"target"`
+	Kind   EgressKind `json:"kind"`
 }
 
 // EgressClassifier is implemented by Networked commands whose targets cannot

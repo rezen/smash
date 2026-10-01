@@ -10,7 +10,7 @@ story without modifying the installer.
 > container. External commands are real host binaries, and an unmodelled command
 > runs with an audit warning unless `-strict` is enabled. Use `-strict` for
 > scripts you do not trust, and add OS-level confinement when you need a hard
-> security boundary.
+> security boundary. Monitor mode disables local policy enforcement.
 
 | Capability | What `smash` does |
 |---|---|
@@ -117,6 +117,10 @@ Useful command-line controls:
 
 | Flag | Purpose |
 |---|---|
+| `-i`, `-interactive` | Start a persistent interactive shell |
+| `-mode block\|monitor` | Enforce local policy or observe only |
+| `-approve URL\|prompt` | Connect RPC supervisor or terminal approval |
+| `-approve-timeout D` | Per-decision timeout (default 60s) |
 | `-policy FILE` | Read the complete run configuration from YAML |
 | `-profile` | Run and write a manifest with the script hash, commands, GitHub owner/repo URL prefixes, and hosts |
 | `-profile-output FILE` | Choose the profile path instead of `<script>.manifest.yaml` |
@@ -132,6 +136,23 @@ Useful command-line controls:
 | `-data N` | Capture up to `N` bytes of stdin and stdout per command |
 
 See the [CLI reference](docs/cli.md) for every flag and its precedence rules.
+
+## Interactive shell
+
+```bash
+smash -i                               # persistent shell, audit saved to a file
+smash -i -mode monitor -audit run.yaml  # observe without local enforcement
+smash -i -approve prompt                # approve external commands at the terminal
+smash -i -approve https://ops.example   # Connect RPC supervisor
+```
+
+State persists between commands; Ctrl-C cancels the current input or command,
+Ctrl-D exits, and piped input shares stdin with commands such as `read`.
+The REPL clears its root on startup and uses plain output without the split
+view. By default, its audit stream is saved to a unique `smash-*.audit.yaml`
+file in the current directory. Use `-audit -` to write it to stderr or
+`-audit ''` to disable it. Approval can only narrow local permission. See [interactive mode](docs/cli.md#interactive-mode)
+and the [Connect RPC approval protocol](docs/approver.md).
 
 ## Policy files
 

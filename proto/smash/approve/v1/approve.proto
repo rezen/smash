@@ -1,0 +1,92 @@
+syntax = "proto3";
+package smash.approve.v1;
+option go_package = "github.com/rezen/smash/gen/smash/approve/v1;approvev1";
+
+// ApprovalService narrows the caller's local command policy. It cannot grant
+// permissions that local enforcement refuses. Session identifiers are unique
+// client-generated opaque strings, not authentication credentials.
+service ApprovalService {
+  rpc OpenSession(OpenSessionRequest) returns (OpenSessionResponse);
+  // Independent calls may execute concurrently and finish in any order.
+  rpc Approve(ApproveRequest) returns (ApproveResponse);
+  // Optional, ordered audit stream. The server processes records as they arrive.
+  rpc Audit(stream AuditRequest) returns (AuditResponse);
+}
+message OpenSessionRequest {
+  uint32 version = 1;
+  string session = 2;
+  int64 pid = 3;
+  string user = 4;
+  string host = 5;
+  string root = 6;
+  string mode = 7;
+  bool interactive = 8;
+}
+message OpenSessionResponse {
+  uint32 version = 1;
+  bool audit = 2;
+  // Zero keeps the client's configured timeout. Negative values are invalid.
+  int64 timeout_ms = 3;
+}
+message Resource { string kind = 1; string action = 2; string value = 3; }
+message Egress {
+  string target = 1;
+  // 0 = indicator, 1 = endpoint, 2 = URL (command.EgressKind).
+  uint32 kind = 2;
+}
+message FileChange {
+  string op = 1;
+  string path = 2;
+  string from = 3;
+  bool recursive = 4;
+}
+message Command {
+  string name = 1;
+  repeated string argv = 2;
+  string line = 3;
+  repeated string wrappers = 4;
+  repeated Resource resources = 5;
+  Egress egress = 6;
+  repeated FileChange files = 7;
+  // allowed, unlisted, sensitive-blocked, strict-blocked, disabled-blocked,
+  // in-root-script, in-root-interpreter, or in-root-native.
+  string verdict = 8;
+}
+message ApproveRequest {
+  string session = 1;
+  string id = 2;
+  string dir = 3;
+  Command command = 4;
+}
+enum Remember {
+  REMEMBER_UNSPECIFIED = 0; // Do not remember.
+  REMEMBER_ARGV = 1;
+  REMEMBER_NAME = 2;
+}
+message ApproveResponse {
+  // Missing allow is malformed, so a broken server cannot silently grant access.
+  optional bool allow = 1;
+  string reason = 2;
+  Remember remember = 3;
+}
+message AuditRecord {
+  string name = 1;
+  string command = 2;
+  string params = 3;
+  repeated Resource resources = 4;
+  Egress egress = 5;
+  string served = 6;
+  repeated FileChange files = 7;
+  int32 exit = 8;
+  string error = 9;
+  string reason = 10;
+  string content_type = 11;
+  string sniffed = 12;
+  repeated string via = 13;
+  repeated string wrappers = 14;
+  bool unlisted = 15;
+  bool in_root = 16;
+  int64 duration_ms = 17;
+}
+message AuditRequest { string session = 1; AuditRecord record = 2; }
+message AuditResponse { uint64 records = 1; }

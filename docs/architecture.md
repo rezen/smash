@@ -1,14 +1,17 @@
 # Architecture
 
 `smash` separates shell interpretation, command understanding, policy
-enforcement, and user-facing configuration into a CLI and three internal
+enforcement, and user-facing configuration into a CLI and focused internal
 packages:
 
 ```text
 cmd/smash          CLI, script loading, root setup, flag precedence, PTY-backed tview UI
 internal/policy    YAML schema, validation, and template generation
 internal/command   pure argv parsing and command capabilities
-internal/sandbox   mvdan/sh runner, enforcement middleware, and auditing
+internal/sandbox   mvdan/sh runner, persistent Session, enforcement, and auditing
+internal/repl      incremental parsing, shared stdin, prompts, cancellation
+internal/approve   Connect RPC client, protobuf adapters, terminal judge
+gen/smash/approve/v1  generated public protobuf and Connect client/server API
 ```
 
 The [repository layout](layout.md) lists the individual files and fixtures.
@@ -22,6 +25,7 @@ shell AST
   → unwrap wrappers and parse the real command once
   → iterate find/xargs actions when present
   → apply disable rules and mocks
+  → request external approval when configured
   → reinterpret shell runners when needed
   → apply downloader, egress, and command gates
   → execute in-process behavior or a host binary (attached to the script PTY when interactive)
@@ -32,6 +36,23 @@ The concrete middleware ordering preserves two important properties: all guards
 see the real command behind wrappers, and an explicitly disabled command cannot
 be mocked back into existence. The middleware stack is built once per run and
 shared by confined nested shells and iterator invocations.
+
+## Persistent sessions and approval
+
+`RunContext`, `RunVars`, and `NewSession` share runner construction. A Session
+builds its stack once and runs statement batches with persistent shell state;
+zero timeout means unbounded, and positive timeouts apply per batch. The CLI
+supplies an interactive runner and never starts the split view for REPL input.
+The line source reads only at prompts, byte by byte for non-terminal input,
+so the interpreter and commands consume the same stdin without parser read-ahead.
+
+In block mode `approve` sits after `mock`, before `git-version`. In monitor
+mode it sits after `sudo-grant`, before `sh-interp`. The surrounding audit layer
+records denials with their reason and serving layer. Gate verdicts are computed
+without executing; commands that will be served in process still need approval.
+Local network checks remain after approval. The cache lives in the shared
+middleware so nested runners reuse decisions. Connect's unary calls handle
+concurrent approvals; a separate client stream carries the optional audit feed.
 
 ## Command capabilities
 

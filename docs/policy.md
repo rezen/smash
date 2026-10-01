@@ -91,10 +91,36 @@ Changing `HOME`, `TMPDIR`, `PATH`, `SHELL`, or related environment entries can
 weaken or break the intended root behavior. Treat those replacements as policy
 changes, not ordinary application configuration.
 
+## Run mode and approval
+
+```yaml
+mode: block  # block or monitor
+approve:
+  url: https://approver.example  # Connect RPC base URL, or "prompt"
+  timeout: 60s
+  headers:
+    Authorization: Bearer literal-token
+```
+
+`mode: monitor` selects the existing profile observation stack without creating
+a manifest. Local command and network gates are disabled; an external approver
+still enforces its decisions. The `approve` section configures a Connect RPC
+supervisor, or terminal confirmation when `url: prompt`. Approval errors and
+timeouts deny the command. A server's positive `timeout_ms` reply overrides the
+configured decision timeout after startup.
+
+Headers are literal: `${SMASH_APPROVE_TOKEN}` inside YAML is not expanded.
+Set `SMASH_APPROVE_TOKEN` in the process environment to supply a bearer header
+when Authorization is absent. Typed `-mode`, `-approve`, and
+`-approve-timeout` override their policy fields. A policy `timeout` applies per
+interactive batch; without it a REPL has no execution deadline. See
+[the protocol and examples](approver.md).
+
 ## Audit settings
 
 `audit.path` is `-` for stderr, an empty string to disable the audit stream, or
-a file path. `audit.data` is the maximum number of bytes captured separately
+a file path. In interactive mode, an omitted audit path defaults to a unique
+`smash-*.audit.yaml` file in the current directory. `audit.data` is the maximum number of bytes captured separately
 from each command's stdin and stdout. A value of zero records metadata and
 resources without payload data.
 
