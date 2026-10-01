@@ -105,7 +105,19 @@ func (Find) Names() []string                { return []string{"find"} }
 func (Find) Parse(a []string) ParsedCommand { return Spec{}.Parse(a) }
 func (Find) builtin()                       {}
 func (Find) Params(p ParsedCommand) Params  { return findParamsFrom(p.raw) }
-func (Find) Unwrap(args []string) []string  { return findParamsFrom(args).ExecArgv() }
+func (Find) FileChanges(p ParsedCommand) []FileChange {
+	fp := findParamsFrom(p.raw)
+	for _, a := range fp.Expression {
+		if a == "-delete" {
+			var changes []FileChange
+			for _, path := range fp.Paths {
+				changes = append(changes, FileChange{Op: FileDelete, Path: path, Recursive: true})
+			}
+			return changes
+		}
+	}
+	return nil
+}
 
 // builtinCommands is the registry of safe local tools. curl/wget/openssl/ssh/…
 // are deliberately NOT here — those are network-capable and gated separately.

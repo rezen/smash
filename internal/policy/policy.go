@@ -13,7 +13,9 @@
 package policy
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"slices"
 	"strconv"
@@ -98,7 +100,7 @@ type Mock struct {
 
 // Match selects the invocations a Mock answers. Every field that is set must
 // hold, so `name` plus `resource` is "this command reaching that URL". The
-// dynamic matchers (sandbox.MatchFunc, Mock.Respond) are Go-only and have no
+// dynamic responders (Mock.Respond) are Go-only and have no
 // YAML spelling.
 type Match struct {
 	Name     Strings   `yaml:"name"`     // command name, or any of several
@@ -130,7 +132,7 @@ func Parse(b []byte, name string) (*File, error) {
 	dec.KnownFields(true) // a mistyped key is a silently missing rule; refuse it
 	var f File
 	if err := dec.Decode(&f); err != nil {
-		if err.Error() == "EOF" { // an empty file is a policy that says nothing
+		if errors.Is(err, io.EOF) { // an empty file is a policy that says nothing
 			return &File{}, nil
 		}
 		return nil, fmt.Errorf("%s: %w", name, err)

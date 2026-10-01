@@ -109,7 +109,7 @@ func (Find) Resources(p ParsedCommand) []Resource {
 // Shell: `sh -c CODE` runs a script string, `sh FILE` runs a file, bare `sh`
 // reads the script from stdin.
 func (Shell) Resources(p ParsedCommand) []Resource {
-	if script, _, ok := extractDashC(p.raw); ok {
+	if script, ok := p.FlagValue("-c"); ok {
 		return []Resource{{Kind: "script", Action: "run", Value: script}}
 	}
 	if len(p.Operands) > 0 {

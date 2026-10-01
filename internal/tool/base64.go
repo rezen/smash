@@ -23,7 +23,10 @@ func Base64(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 			return next(ctx, args)
 		}
 		hc := interp.HandlerCtx(ctx)
-		parsed := command.Parse(args)
+		parsed, ok := command.ParsedFrom(ctx, args)
+		if !ok {
+			parsed = command.Parse(args)
+		}
 		params, ok := parsed.TypedParams().(command.Base64Params)
 		if !ok {
 			return Failf(hc.Stderr, 1, "base64: could not parse arguments")
@@ -32,7 +35,7 @@ func Base64(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 			return Failf(hc.Stderr, 1, "base64: extra operand %q", parsed.Operands[1])
 		}
 
-		in := hc.Stdin
+		in := stdinOrEmpty(hc.Stdin)
 		var file *os.File
 		if params.File != "" && params.File != "-" {
 			name := params.File

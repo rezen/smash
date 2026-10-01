@@ -268,16 +268,22 @@ func (d DockerExecParams) String() string  { return JoinArgs(d.Args()) }
 // that can consult a registry are networked, and their first operand is the
 // image/registry target.
 func (DockerCommand) Egress(p ParsedCommand) (string, bool) {
-	if !dockerNetworkSubcommands[p.Subcommand] || len(p.Operands) == 0 || p.Operands[0] == "" {
+	if !dockerNetworkSubcommands[p.Subcommand] {
 		return "", false
 	}
-	return p.Operands[0], true
+	if len(p.Operands) > 0 && p.Operands[0] != "" {
+		return p.Operands[0], true
+	}
+	return p.Subcommand, true
 }
 
 // Resources keeps non-networked operands visible while describing registry
 // operations as image access, matching the former NetTool representation.
 func (d DockerCommand) Resources(p ParsedCommand) []Resource {
 	if target, networked := d.Egress(p); networked {
+		if target == p.Subcommand {
+			return []Resource{{Kind: "registry", Action: p.Subcommand}}
+		}
 		return []Resource{{Kind: "image", Action: "access", Value: target}}
 	}
 	return operandResources(p, "operand", "", false)

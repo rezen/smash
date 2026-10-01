@@ -57,7 +57,9 @@ func (o Spec) Parse(args []string) ParsedCommand {
 				p.Flags[name] = append(p.Flags[name], "")
 			}
 		default:
-			if o.ClusterShort && len(a) > 2 && !o.ValueFlags[a] {
+			if len(a) > 2 && o.AttachedValue[a[:2]] {
+				p.Flags[a[:2]] = append(p.Flags[a[:2]], a[2:])
+			} else if o.ClusterShort && len(a) > 2 && !o.ValueFlags[a] {
 				i += o.parseShortCluster(&p, a, rest, i)
 			} else if o.ValueFlags[a] && i+1 < len(rest) {
 				p.Flags[a] = append(p.Flags[a], rest[i+1])

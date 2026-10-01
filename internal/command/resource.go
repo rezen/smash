@@ -56,8 +56,15 @@ func (p ParsedCommand) Resources() []Resource {
 	if s, ok := p.cmd.(Structured); ok {
 		return resourcesOf(s.Params(p))
 	}
-	if target, networked := p.Egress(); networked {
-		return []Resource{{Kind: kindOf(target), Action: "connect", Value: target}}
+	if e, networked := p.EgressInfo(); networked {
+		kind := "indicator"
+		switch e.Kind {
+		case EgressURL:
+			kind = "url"
+		case EgressEndpoint:
+			kind = "host"
+		}
+		return []Resource{{Kind: kind, Action: "connect", Value: e.Target}}
 	}
 	return operandResources(p, "operand", "", false)
 }
@@ -85,22 +92,13 @@ func resourcesOf(params any) []Resource {
 		return nil
 	}
 	var rs []Resource
-	t := v.Type()
-	for i := 0; i < t.NumField(); i++ {
-		tag, ok := t.Field(i).Tag.Lookup("resource")
-		if !ok {
+	for _, f := range fieldsOf(v.Type()) {
+		if f.resource.kind == "" {
 			continue
 		}
-		parts := strings.SplitN(tag, ",", 3)
-		kind, action, stream := parts[0], "", ""
-		if len(parts) > 1 {
-			action = parts[1]
-		}
-		if len(parts) > 2 {
-			stream = parts[2]
-		}
+		kind, action, stream := f.resource.kind, f.resource.action, f.resource.stream
 		n := 0
-		switch fv := v.Field(i); fv.Kind() {
+		switch fv := v.FieldByIndex(f.index); fv.Kind() {
 		case reflect.String:
 			if s := fv.String(); s != "" && s != "-" {
 				rs = append(rs, Resource{Kind: kind, Action: action, Value: s})

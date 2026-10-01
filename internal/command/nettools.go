@@ -26,6 +26,7 @@ type NetTool struct {
 	Kind        string   // resource kind of the target for audit logs ("" = host)
 	Action      string   // what the tool does with it ("" = connect)
 	Secrets     []string // flags whose values are credentials (mysql -p), redacted in logs
+	Attached    []string // short flags that accept an attached value
 }
 
 func (n NetTool) SecretFlags() []string { return n.Secrets }
@@ -45,8 +46,12 @@ func (n NetTool) Resources(p ParsedCommand) []Resource {
 	return operandResources(p, "operand", "", false)
 }
 
-func (n NetTool) Names() []string                { return n.Aliases }
-func (n NetTool) Parse(a []string) ParsedCommand { return n.Spec.Parse(a) }
+func (n NetTool) Names() []string { return n.Aliases }
+func (n NetTool) Parse(a []string) ParsedCommand {
+	s := n.Spec
+	s.AttachedValue = NewSet(n.Attached...)
+	return s.Parse(a)
+}
 func (n NetTool) Egress(p ParsedCommand) (string, bool) {
 	if len(n.Subcommands) > 0 && !n.Subcommands[p.Subcommand] {
 		return "", false
@@ -118,13 +123,13 @@ var netTools = []Command{
 		Subcommands: NewSet("clone", "pull", "push", "incoming", "in", "outgoing", "out", "identify", "id"), Kind: "repo", Action: "access"},
 	// DB clients: local socket unless a host is given
 	NetTool{Aliases: names("mysql", "mariadb", "mysqldump", "mysqladmin"), Spec: Spec{ValueFlags: NewSet("-h", "--host", "-P", "--port", "-u", "--user", "-p", "--password", "-e", "--execute", "-S", "--socket")},
-		HostFlags: []string{"-h", "--host"}, Kind: "database", Secrets: []string{"-p", "--password"}},
+		HostFlags: []string{"-h", "--host"}, Kind: "database", Secrets: []string{"-p", "--password"}, Attached: []string{"-p"}},
 	NetTool{Aliases: names("psql", "pg_dump", "pg_restore", "pg_isready"), Spec: Spec{ValueFlags: NewSet("-h", "--host", "-p", "--port", "-U", "--username", "-d", "--dbname", "-c", "--command", "-f", "--file")},
 		HostFlags: []string{"-h", "--host"}, Kind: "database"},
 	NetTool{Aliases: names("redis-cli"), Spec: Spec{ValueFlags: NewSet("-h", "-p", "-a", "-n", "-u", "-s")},
 		HostFlags: []string{"-h", "-u"}, Kind: "database", Secrets: []string{"-a", "-u", "--pass", "--user"}},
 	NetTool{Aliases: names("mongosh", "mongo"), Spec: Spec{ValueFlags: NewSet("--host", "--port", "-u", "--username", "-p", "--password", "--eval")},
-		HostFlags: []string{"--host"}, Kind: "database", Secrets: []string{"-p", "--password"}},
+		HostFlags: []string{"--host"}, Kind: "database", Secrets: []string{"-p", "--password"}, Attached: []string{"-p"}},
 }
 
 // Gpg is a Builtin (offline signature checks are what installers need) that

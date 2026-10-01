@@ -61,7 +61,7 @@ tidy-check: _ensure-sh
     go mod tidy
     git diff --exit-code -- go.mod go.sum
 
-# Run staticcheck (not a CI gate yet: two deprecation findings outstanding).
+# Run staticcheck.
 lint: _ensure-sh
     go run honnef.co/go/tools/cmd/staticcheck@latest ./...
 
@@ -117,8 +117,8 @@ release version: ci
     git push origin "{{version}}"
     echo "release: pushed {{version}}; watch the Release workflow on GitHub"
 
-# Everything the required CI jobs check: fmt, tidy, vet, build, test, race, cross-compile.
-ci: fmt-check tidy-check vet cross test race
+# Everything the required CI jobs check: fmt, tidy, vet, lint, build, test, race, cross-compile.
+ci: fmt-check tidy-check vet lint cross test race
 
 # Remove build products: the binary, dist/, and the generated third_party/sh.
 clean:

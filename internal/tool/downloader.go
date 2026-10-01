@@ -55,11 +55,14 @@ func Downloaders(cfg DownloaderConfig) func(interp.ExecHandlerFunc) interp.ExecH
 			if len(args) == 0 {
 				return next(ctx, args)
 			}
-			d, ok := command.Lookup(args[0]).(command.Downloader)
+			parsed, cached := command.ParsedFrom(ctx, args)
+			if !cached {
+				parsed = command.Parse(args)
+			}
+			d, ok := parsed.Command().(command.Downloader)
 			if !ok {
 				return next(ctx, args)
 			}
-			parsed := command.Parse(args)
 			name := filepath.Base(args[0])
 			hc := interp.HandlerCtx(ctx)
 			if parsed.HasFlag("--version", "-V") {
@@ -96,10 +99,10 @@ func runDownloader(ctx context.Context, cfg DownloaderConfig, name string, req c
 	}
 	u, err := url.Parse(req.URL)
 	if err != nil {
-		return Failf(hc.Stderr, 3, "%s: bad URL %q: %v", name, req.URL, err)
+		return Failf(hc.Stderr, 3, "%s: bad URL %q: %v", name, command.RedactURL(req.URL), err)
 	}
 	if cfg.AllowURL == nil || !cfg.AllowURL(u) {
-		return Failf(hc.Stderr, 6, "%s: [sandbox] URL not in allow-list: %s", name, u)
+		return Failf(hc.Stderr, 6, "%s: [sandbox] URL not in allow-list: %s", name, command.RedactURL(u.String()))
 	}
 	method := req.Method
 	if method == "" {
@@ -144,13 +147,13 @@ func runDownloader(ctx context.Context, cfg DownloaderConfig, name string, req c
 		return Failf(hc.Stderr, 7, "%s: HTTP client is unavailable", name)
 	}
 	if !req.Follow {
-		copy := *client
-		copy.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-		client = &copy
+		noFollow := *client
+		noFollow.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		client = &noFollow
 	}
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		return Failf(hc.Stderr, 7, "%s: %v", name, err)
+		return Failf(hc.Stderr, 7, "%s: %s", name, strings.ReplaceAll(err.Error(), req.URL, command.RedactURL(req.URL)))
 	}
 	defer resp.Body.Close()
 	note := ResponseNoteFrom(ctx)
@@ -158,7 +161,11 @@ func runDownloader(ctx context.Context, cfg DownloaderConfig, name string, req c
 		note.Via = hopURLs(resp)
 	}
 	if req.FailOnHTTP && resp.StatusCode >= 400 {
-		return Failf(hc.Stderr, 22, "%s: The requested URL returned error: %d", name, resp.StatusCode)
+		status := 22
+		if name == "wget" || name == "wget2" {
+			status = 8
+		}
+		return Failf(hc.Stderr, status, "%s: The requested URL returned error: %d", name, resp.StatusCode)
 	}
 
 	var respBody io.Reader = resp.Body

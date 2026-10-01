@@ -111,6 +111,7 @@ func DefaultSensitiveList() command.Set {
 type gateNote struct {
 	Unlisted bool // ran although neither allow-listed nor sensitive
 	InRoot   bool // ran through the in-sandbox escape hatch
+	Served   string
 }
 
 type gateNoteKey struct{}
@@ -130,6 +131,7 @@ func gateNoteFrom(ctx context.Context) *gateNote {
 // gate is the command gate's policy: the sets it consults, the root whose
 // contents may run, and how to interpret an in-root shell script confined.
 type gate struct {
+	registry               *command.Registry
 	root                   string
 	allowed                command.Set
 	sensitive              command.Set
@@ -220,7 +222,11 @@ func (g gate) runFromRoot(ctx context.Context, execute interp.ExecHandlerFunc, h
 		// again — the same treatment `sh -c` gets, for the same reason. That
 		// keeps the hatch useful, since installers really do ship shell
 		// wrappers, without making it a hole.
-		if _, isShell := command.Lookup(name).(command.ScriptRunner); isShell && g.interpret != nil {
+		registry := g.registry
+		if registry == nil {
+			registry = command.Default
+		}
+		if _, isShell := registry.Lookup(name).(command.ScriptRunner); isShell && g.interpret != nil {
 			return g.interpret(ctx, hc, path, args[1:], name == "sh")
 		}
 		switch {

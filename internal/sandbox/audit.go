@@ -32,13 +32,13 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode"
-	"unicode/utf8"
 
+	"golang.org/x/term"
 	"mvdan.cc/sh/v3/interp"
 
 	"github.com/rezen/smash/internal/command"
 	"github.com/rezen/smash/internal/tool"
+	"github.com/rezen/smash/internal/yamlenc"
 )
 
 // AuditRecord is everything the sandbox knows about one executed command.
@@ -47,6 +47,8 @@ type AuditRecord struct {
 	Command     string               // normalized command line, e.g. "base64 -d" (secrets redacted)
 	Params      command.Params       // typed params (Base64Params, CurlParams, …) or the generic ParsedCommand, redacted
 	Resources   []command.Resource   // what it touched: "read stdin", "fetch url …"
+	Egress      *command.Egress      // classified network target, when this invocation egresses
+	Served      string               // layer that handled the invocation; empty when a host process ran
 	Files       []command.FileChange // filesystem changes, for monitoring: "delete /x (recursive)"
 	Exit        error                // nil on success; interp.ExitStatus(n) otherwise
 	Reason      string               // the sandbox's own diagnostic when IT failed the command (blocked, off-list URL…); "" if the program ran
@@ -63,8 +65,9 @@ type AuditRecord struct {
 
 // Capture is a bounded copy of a stream: the first Cap bytes plus the total.
 type Capture struct {
-	Data  []byte
-	Total int64 // bytes that actually flowed, which may exceed len(Data)
+	Data     []byte
+	Total    int64 // bytes that actually flowed, which may exceed len(Data)
+	Terminal bool
 }
 
 func (c Capture) String() string {
@@ -303,6 +306,9 @@ func (t *textAuditor) Audit(r AuditRecord) {
 	if r.Reason != "" {
 		rec.add("reason", t.scalar(r.Reason))
 	}
+	if r.Served != "" && r.Reason == "" && r.Served != "gate" {
+		rec.add("served", t.scalar(r.Served))
+	}
 	if r.ContentType != "" {
 		rec.add("content-type", t.scalar(r.ContentType))
 	}
@@ -327,6 +333,8 @@ func (t *textAuditor) Audit(r AuditRecord) {
 	}
 	if r.Stdout.Total > 0 {
 		rec.add("stdout", captureYAML(r.Stdout))
+	} else if r.Stdout.Terminal {
+		rec.add("stdout", "terminal")
 	}
 	t.write(rec.String())
 }
@@ -350,7 +358,7 @@ func (r *yamlRecord) add(key, value string) {
 func (r *yamlRecord) String() string { return r.b.String() }
 
 // scalar renders one text value: paths abbreviated, then quoted if YAML needs it.
-func (t *textAuditor) scalar(s string) string { return yamlScalar(t.shorten(s)) }
+func (t *textAuditor) scalar(s string) string { return yamlenc.Scalar(t.shorten(s)) }
 
 // list renders values as a flow sequence: [a, b].
 func (t *textAuditor) list(vals []string) string {
@@ -373,23 +381,31 @@ func (t *textAuditor) params(p command.Params) string {
 	}
 	typ := v.Type()
 	var fields []string
-	for i := range typ.NumField() {
-		f := typ.Field(i)
-		fv := v.Field(i)
-		if !f.IsExported() || fv.IsZero() || fv.Kind() == reflect.Slice && fv.Len() == 0 {
-			continue // Redact leaves empty non-nil slices behind; they're unset too
+	var walk func(reflect.Value)
+	walk = func(v reflect.Value) {
+		for i := range v.NumField() {
+			f := v.Type().Field(i)
+			fv := v.Field(i)
+			if f.Anonymous && fv.Kind() == reflect.Struct {
+				walk(fv)
+				continue
+			}
+			if !f.IsExported() || fv.IsZero() || fv.Kind() == reflect.Slice && fv.Len() == 0 {
+				continue // Redact leaves empty non-nil slices behind; they're unset too
+			}
+			var val string
+			switch x := fv.Interface().(type) {
+			case string:
+				val = t.scalar(x)
+			case []string:
+				val = t.list(x)
+			default:
+				val = fmt.Sprint(x) // bools and numbers are YAML as printed
+			}
+			fields = append(fields, f.Name+": "+val)
 		}
-		var val string
-		switch x := fv.Interface().(type) {
-		case string:
-			val = t.scalar(x)
-		case []string:
-			val = t.list(x)
-		default:
-			val = fmt.Sprint(x) // bools and numbers are YAML as printed
-		}
-		fields = append(fields, f.Name+": "+val)
 	}
+	walk(v)
 	if len(fields) == 0 {
 		return ""
 	}
@@ -441,88 +457,6 @@ func isPathByte(c byte) bool {
 		'0' <= c && c <= '9' || 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z'
 }
 
-// yamlScalar renders s as a YAML scalar: plain when a parser would read it
-// back unchanged as a string, otherwise double-quoted. Quoting is decided for
-// flow context (the stricter one), so the same rule serves block values,
-// sequence items and mapping values alike. Go's quoted form is valid YAML:
-// both use \n, \t, \", \\, \xNN, \uNNNN and \UNNNNNNNN.
-func yamlScalar(s string) string {
-	if s == "" || plainWouldMisread(s) {
-		return strconv.Quote(s)
-	}
-	return s
-}
-
-// plainWouldMisread reports whether a plain (unquoted) scalar carrying s
-// would be read back as anything other than this exact string. Each predicate
-// names one way that can happen; double-quoting is the answer to all of them.
-func plainWouldMisread(s string) bool {
-	return !utf8.ValidString(s) || // strconv.Quote escapes what plain can't carry
-		trimsDifferently(s) ||
-		startsWithIndicator(s) ||
-		containsFlowIndicator(s) ||
-		readsAsMappingOrComment(s) ||
-		containsNonPrintable(s) ||
-		readsAsNullBoolOrFloat(s) ||
-		readsAsNumber(s)
-}
-
-// trimsDifferently: a plain scalar sheds leading and trailing whitespace, so
-// a value with either would come back shortened.
-func trimsDifferently(s string) bool { return strings.TrimSpace(s) != s }
-
-// startsWithIndicator: indicator characters cannot begin a plain scalar —
-// "- x" is a sequence item, "&x" an anchor, "!x" a tag, and so on.
-func startsWithIndicator(s string) bool {
-	return s != "" && strings.ContainsAny(s[:1], "-?:,[]{}#&*!|>'\"%@`")
-}
-
-// containsFlowIndicator: the scalar must survive flow context ("[a, b]"),
-// where , [ ] { } end a plain scalar wherever they appear — and go-yaml ends
-// one at "?" too, so an unquoted URL with a query string would corrupt a
-// resources: [...] list (found by TestTextAuditorEmitsValidYAML).
-func containsFlowIndicator(s string) bool { return strings.ContainsAny(s, ",[]{}?") }
-
-// readsAsMappingOrComment: ": " (or a trailing ":") would turn the value into
-// a mapping, and " #" starts a comment mid-scalar.
-func readsAsMappingOrComment(s string) bool {
-	return strings.Contains(s, ": ") || strings.Contains(s, " #") || strings.HasSuffix(s, ":")
-}
-
-// containsNonPrintable: control characters and other unprintables only
-// survive inside a double-quoted scalar's escapes.
-func containsNonPrintable(s string) bool {
-	for _, r := range s {
-		if !unicode.IsPrint(r) {
-			return true
-		}
-	}
-	return false
-}
-
-// readsAsNullBoolOrFloat: the words YAML resolves to null, a boolean or a
-// special float, in any case ("Yes", "NULL", "-.Inf").
-func readsAsNullBoolOrFloat(s string) bool {
-	switch strings.ToLower(s) {
-	case "~", "null", "true", "false", "yes", "no", "on", "off", "y", "n", ".inf", "-.inf", "+.inf", ".nan":
-		return true
-	}
-	return false
-}
-
-// readsAsNumber: anything that could resolve numerically (600, 1e3, 0x1f,
-// 1:30, -1, .5). Over-broad on purpose: a quoted number is still the same
-// string, while a misread one is not.
-func readsAsNumber(s string) bool {
-	if s == "" {
-		return false
-	}
-	if c := s[0]; '0' <= c && c <= '9' {
-		return true
-	}
-	return len(s) > 1 && strings.ContainsRune("+-.", rune(s[0])) && '0' <= s[1] && s[1] <= '9'
-}
-
 func durationString(d time.Duration) string {
 	if d < time.Millisecond {
 		return "<1ms"
@@ -536,7 +470,7 @@ func exitCode(err error) (int, bool) {
 	if err == nil {
 		return 0, true
 	}
-	if code, ok := interp.IsExitStatus(err); ok {
+	if code, ok := errors.AsType[interp.ExitStatus](err); ok {
 		return int(code), true
 	}
 	return 0, false
@@ -548,10 +482,13 @@ func exitCode(err error) (int, bool) {
 func auditMiddleware(a Auditor, dataCap int) Middleware {
 	return func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 		return func(ctx context.Context, args []string) error {
+			if driver, _ := ctx.Value(iterationDriverKey{}).(bool); driver {
+				return next(ctx, args)
+			}
 			if len(args) == 0 {
 				return next(ctx, args)
 			}
-			p := command.Parse(args)
+			p := parsedFrom(ctx, args)
 			var in, out capBuf
 			if dataCap > 0 {
 				hc := interp.HandlerCtx(ctx)
@@ -559,13 +496,22 @@ func auditMiddleware(a Auditor, dataCap int) Middleware {
 				if hc.Stdin != nil {
 					hc.Stdin = io.TeeReader(hc.Stdin, &in)
 				}
-				hc.Stdout = io.MultiWriter(hc.Stdout, &out)
+				if f, ok := hc.Stdout.(*os.File); ok && term.IsTerminal(int(f.Fd())) {
+					out.terminal = true
+				} else {
+					hc.Stdout = io.MultiWriter(hc.Stdout, &out)
+				}
 				ctx = interp.WithHandlerContext(ctx, hc)
 			}
 			ctx, note := withGateNote(ctx)              // filled in by the command gate
 			ctx, respNote := tool.WithResponseNote(ctx) // filled in by the in-process downloader
 			start := time.Now()
 			err := next(ctx, args)
+			var egress *command.Egress
+			if e, ok := p.EgressInfo(); ok {
+				e.Target = command.RedactURL(e.Target)
+				egress = &e
+			}
 			params := command.Redact(p.TypedParams()) // never log credentials
 			var reason string
 			if f, ok := errors.AsType[*Failure](err); ok {
@@ -575,13 +521,15 @@ func auditMiddleware(a Auditor, dataCap int) Middleware {
 				Name:        p.Name,
 				Command:     params.String(),
 				Params:      params,
-				Resources:   p.Resources(),
+				Resources:   command.RedactResources(p.Resources()),
+				Egress:      egress,
+				Served:      note.Served,
 				Files:       p.FileChanges(),
 				Exit:        err,
 				Reason:      reason,
 				ContentType: respNote.ContentType,
 				Sniffed:     respNote.Sniffed,
-				Via:         respNote.Via,
+				Via:         redactURLs(respNote.Via),
 				Wrappers:    wrappersFrom(ctx),
 				Unlisted:    note.Unlisted,
 				InRoot:      note.InRoot,
@@ -592,6 +540,14 @@ func auditMiddleware(a Auditor, dataCap int) Middleware {
 			return err
 		}
 	}
+}
+
+func redactURLs(values []string) []string {
+	out := make([]string, len(values))
+	for i, value := range values {
+		out[i] = command.RedactURL(value)
+	}
+	return out
 }
 
 // auditOpenMiddleware reports every shell open — after the rest of the open
@@ -612,9 +568,10 @@ func auditOpenMiddleware(a OpenAuditor) OpenMiddleware {
 
 // capBuf keeps the first limit bytes written and counts the rest.
 type capBuf struct {
-	buf   bytes.Buffer
-	total int64
-	limit int
+	buf      bytes.Buffer
+	total    int64
+	limit    int
+	terminal bool
 }
 
 func (c *capBuf) Write(p []byte) (int, error) {
@@ -629,4 +586,6 @@ func (c *capBuf) Write(p []byte) (int, error) {
 	return n, nil // never a short write: the cap drops data, it doesn't fail the pipe
 }
 
-func (c *capBuf) capture() Capture { return Capture{Data: c.buf.Bytes(), Total: c.total} }
+func (c *capBuf) capture() Capture {
+	return Capture{Data: c.buf.Bytes(), Total: c.total, Terminal: c.terminal}
+}

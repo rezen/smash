@@ -90,9 +90,6 @@ func (r *Registry) Parse(args []string) ParsedCommand {
 	return p
 }
 
-// Commands returns the registered commands in registration order.
-func (r *Registry) Commands() []Command { return slices.Clone(r.cmds) }
-
 // BuiltinNames returns every name registered by a Builtin command.
 func (r *Registry) BuiltinNames() []string {
 	var names []string

@@ -169,12 +169,17 @@ func TestExtractDashC(t *testing.T) {
 		{[]string{"bash", "-c", "echo hi", "name", "a"}, "echo hi", "name a", true},
 		{[]string{"sh", "-euc", "curl x"}, "curl x", "", true},
 		{[]string{"sh", "-e", "-c", "id"}, "id", "", true},
+		{[]string{"bash", "--norc", "-c", "echo hi"}, "echo hi", "", true},
+		{[]string{"bash", "-o", "errexit", "-c", "id"}, "id", "", true},
+		{[]string{"bash", "--rcfile", "f", "-c", "id"}, "id", "", true},
+		{[]string{"sh", "+x", "-c", "id"}, "id", "", true},
+		{[]string{"sh", "-c", "x", "--", "a"}, "x", "-- a", true},
 		{[]string{"sh", "script.sh"}, "", "", false}, // file, not -c
 		{[]string{"sh"}, "", "", false},
 		{[]string{"sh", "-c"}, "", "", false}, // missing script
 	}
 	for _, c := range cases {
-		script, params, ok := extractDashC(c.args)
+		script, params, ok := (Shell{}).DashC(c.args)
 		if ok != c.wantOK || script != c.wantScript || strings.Join(params, " ") != c.wantParams {
 			t.Errorf("extractDashC(%v) = %q,%q,%v; want %q,%q,%v",
 				c.args, script, params, ok, c.wantScript, c.wantParams, c.wantOK)
@@ -195,7 +200,7 @@ func TestUnwrap(t *testing.T) {
 		{[]string{"timeout", "5", "curl", "URL"}, "timeout", "curl URL"},
 		{[]string{"timeout", "-s", "TERM", "10", "wget", "URL"}, "timeout", "wget URL"},
 		{[]string{"nice", "-n", "10", "make"}, "nice", "make"},
-		{[]string{"xargs", "-n1", "-P4", "rm"}, "xargs", "rm"},
+		{[]string{"xargs", "-n1", "-P4", "rm"}, "", "xargs -n1 -P4 rm"},
 		{[]string{"sudo", "env", "FOO=1", "timeout", "3", "curl", "U"}, "sudo+env+timeout", "curl U"},
 		{[]string{"doas", "-u", "root", "pkg", "install"}, "doas", "pkg install"},
 		// sudo credential probes run nothing: not unwrapped, reach the sandbox as sudo
@@ -208,15 +213,9 @@ func TestUnwrap(t *testing.T) {
 		{[]string{"sudo", "-k", "true"}, "sudo", "true"},     // -k with a command runs it
 		{[]string{"sudo", "-u", "vlad", "id"}, "sudo", "id"}, // a value, not a probe cluster
 		{[]string{"sudo", "-n", "true"}, "sudo", "true"},
-		// xargs: inner command, its -I replace-string, the -i fix, and the echo default
-		{[]string{"xargs", "rm", "-rf"}, "xargs", "rm -rf"},
-		{[]string{"xargs", "-I", "{}", "curl", "{}"}, "xargs", "curl {}"},
-		{[]string{"xargs", "-i", "rm"}, "xargs", "rm"}, // -i must NOT swallow rm
-		{[]string{"xargs", "-0", "-n1", "grep", "x"}, "xargs", "grep x"},
-		{[]string{"xargs"}, "xargs", "echo"}, // no command → echo
-		// find -exec / -execdir peel out the exec'd command (stop at ; or +)
-		{[]string{"find", ".", "-exec", "rm", "-rf", "{}", ";"}, "find", "rm -rf {}"},
-		{[]string{"find", "/tmp", "-execdir", "curl", "http://evil", "{}", "+"}, "find", "curl http://evil {}"},
+		// Iterators keep their argv; each inner invocation re-enters the stack.
+		{[]string{"xargs", "rm", "-rf"}, "", "xargs rm -rf"},
+		{[]string{"find", ".", "-exec", "rm", "-rf", "{}", ";"}, "", "find . -exec rm -rf {} ;"},
 		{[]string{"find", ".", "-name", "*.log"}, "", "find . -name *.log"}, // no exec → not a wrapper
 		// not wrappers / no inner command → unchanged
 		{[]string{"curl", "-o", "x", "URL"}, "", "curl -o x URL"},

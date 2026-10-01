@@ -458,7 +458,7 @@ ps >/dev/null 2>&1; echo ok`, func(c *Config) {
 	if curl == nil {
 		t.Fatalf("no curl record in %+v", recs)
 	}
-	if code, ok := interp.IsExitStatus(curl.Exit); !ok || code != 6 {
+	if code, ok := errors.AsType[interp.ExitStatus](curl.Exit); !ok || code != 6 {
 		t.Errorf("curl exit = %v, want exit 6", curl.Exit)
 	}
 	if !strings.Contains(curl.Reason, "URL not in allow-list: https://evil.example/x") {

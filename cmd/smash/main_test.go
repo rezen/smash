@@ -217,7 +217,7 @@ func TestProfileManifestAndEnforcedRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(m.Commands, []string{"df", "sh", "true"}) {
+	if !slices.Equal(m.Commands, []string{"df", "true"}) {
 		t.Errorf("profile commands = %v", m.Commands)
 	}
 	if len(m.Hosts) != 0 {
@@ -319,7 +319,7 @@ func TestProfileBypassesDownloaderPolicyAndMocks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(m.Commands, []string{"curl"}) || !slices.Equal(m.Hosts, []string{"127.0.0.1"}) {
+	if len(m.Commands) != 0 || !slices.Equal(m.Hosts, []string{"127.0.0.1"}) {
 		t.Errorf("profile = commands %v, hosts %v", m.Commands, m.Hosts)
 	}
 	if m.URLs != nil {

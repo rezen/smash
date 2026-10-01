@@ -26,6 +26,7 @@
 package sandbox
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -79,7 +80,8 @@ type Config struct {
 	// Every other external command and network client runs directly; use only
 	// with separate OS confinement or a script trusted enough to execute
 	// unrestricted.
-	Profile bool
+	Profile  bool
+	Commands *command.Registry // nil uses command.Default
 
 	// AllowSudo answers sudo/doas credential probes (`sudo -v`, `sudo -n -l
 	// mkdir`, `sudo -K`) as if the user had passwordless sudo, so an installer
@@ -94,7 +96,7 @@ type Config struct {
 	// and scripts for an explicitly allowed interpreter remain gated by it.
 	AllowInRootExecutables bool
 
-	Stdin          io.Reader
+	Stdin          io.Reader // nil = empty
 	Stdout, Stderr io.Writer // nil = discard
 	// ControllingTTY, when set, is the PTY interactive external commands should
 	// acquire as /dev/tty. Their ordinary stdin/stdout/stderr still come from
@@ -112,10 +114,7 @@ type Config struct {
 	// shebang-less script that would be piped to sh.
 	Posix bool
 
-	// depth is the `sh -c`/in-root script nesting depth. It rides Config —
-	// rather than a parameter — because each confined sub-runner is built
-	// from a wholesale copy of the parent's Config (see shinterp.go).
-	depth int
+	stack *execStack
 }
 
 // NewConfig returns a Config with the default network policy, allow-list and
@@ -135,6 +134,9 @@ func NewConfig(root, dir string, env expand.Environ) Config {
 
 // normalized fills the zero-value gaps so handlers never see a nil writer.
 func (cfg Config) normalized() Config {
+	if cfg.Stdin == nil {
+		cfg.Stdin = bytes.NewReader(nil)
+	}
 	if cfg.Stdout == nil {
 		cfg.Stdout = io.Discard
 	}
@@ -174,9 +176,16 @@ func RunContext(ctx context.Context, cfg Config, name, src string) error {
 // with.
 func prepareRun(cfg Config, name, src string) (Config, *interp.Runner, *syntax.File, error) {
 	cfg = cfg.normalized()
+	if cfg.Commands == nil {
+		cfg.Commands = command.Default
+	}
 	cfg.Posix = cfg.Posix || shell.IsSh(src)
 	prog, err := parseBash(name, src)
 	if err != nil {
+		return cfg, nil, nil, err
+	}
+	cfg.stack = &execStack{}
+	if _, err := execLayers(cfg); err != nil {
 		return cfg, nil, nil, err
 	}
 	runner, err := buildRunner(cfg)
@@ -297,7 +306,22 @@ type execStack struct {
 
 func (s *execStack) add(name string, mw Middleware) {
 	s.names = append(s.names, name)
-	s.mws = append(s.mws, mw)
+	s.mws = append(s.mws, func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
+		return func(ctx context.Context, args []string) error {
+			called := false
+			handler := mw(func(ctx context.Context, args []string) error {
+				called = true
+				return next(ctx, args)
+			})
+			err := handler(ctx, args)
+			if !called {
+				if note := gateNoteFrom(ctx); note != nil && note.Served == "" {
+					note.Served = name
+				}
+			}
+			return err
+		}
+	})
 }
 
 // execLayers assembles the exec middleware stack, outermost first. The order
@@ -330,11 +354,15 @@ func (s *execStack) add(name string, mw Middleware) {
 func execLayers(cfg Config) (*execStack, error) {
 	enforcing := !cfg.Profile
 	e := cfg.Emulation
-	s := &execStack{}
-	s.add("unwrap", unwrapMiddleware)
+	s := cfg.stack
+	if s == nil {
+		s = &execStack{}
+	}
+	s.add("unwrap", unwrapMiddleware(cfg.Commands))
 	if cfg.Auditor != nil {
 		s.add("audit", auditMiddleware(cfg.Auditor, cfg.AuditData))
 	}
+	s.add("iterate", iterateMiddleware(cfg))
 	if enforcing && len(cfg.Denied) > 0 {
 		s.add("deny", denyMiddleware(cfg.Denied))
 	}
@@ -363,7 +391,8 @@ func execLayers(cfg Config) (*execStack, error) {
 		s.add("http", httpMW)
 		s.add("egress", egressGuardMiddleware(cfg.Network))
 		s.add("gate", allowListMiddleware(gate{
-			root: cfg.Root, allowed: cfg.Allowed, sensitive: cfg.Sensitive,
+			registry: cfg.Commands,
+			root:     cfg.Root, allowed: cfg.Allowed, sensitive: cfg.Sensitive,
 			denied: cfg.Denied, strict: cfg.Strict,
 			allowInRootExecutables: cfg.AllowInRootExecutables,
 			allowedPaths:           resolveAllowedPaths(cfg),
@@ -388,9 +417,13 @@ func execLayers(cfg Config) (*execStack, error) {
 // /dev/tcp and the audit of the shell's own opens (redirections, `source`).
 func buildRunner(cfg Config) (*interp.Runner, error) {
 	e := cfg.Emulation
-	stack, err := execLayers(cfg)
-	if err != nil {
-		return nil, err
+	stack := cfg.stack
+	if stack == nil {
+		var err error
+		stack, err = execLayers(cfg)
+		if err != nil {
+			return nil, err
+		}
 	}
 	var opens []OpenMiddleware
 	if !cfg.Profile {

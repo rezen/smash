@@ -7,6 +7,7 @@ package command
 // secret flags, plus any the command declares via SecretFlags.
 
 import (
+	"net/url"
 	"reflect"
 	"strings"
 )
@@ -39,19 +40,23 @@ func (p ParsedCommand) Redacted() ParsedCommand {
 	}
 	out := p
 	out.Flags = make(map[string][]string, len(p.Flags))
+	out.attached = p.attached.Clone()
 	for name, vals := range p.Flags {
-		if !secretFlags[name] && !extra[name] {
-			out.Flags[name] = vals
-			continue
+		if secretFlags[name] || extra[name] {
+			delete(out.attached, name)
 		}
 		red := make([]string, len(vals))
 		for i, v := range vals {
-			if v != "" {
+			if v != "" && (secretFlags[name] || extra[name]) {
 				v = Redacted
 			}
-			red[i] = v
+			red[i] = RedactURL(v)
 		}
 		out.Flags[name] = red
+	}
+	out.Operands = make([]string, len(p.Operands))
+	for i, v := range p.Operands {
+		out.Operands[i] = RedactURL(v)
 	}
 	return out
 }
@@ -72,33 +77,61 @@ func Redact(params Params) Params {
 	}
 	cp := reflect.New(v.Type()).Elem()
 	cp.Set(v)
-	for i := 0; i < v.NumField(); i++ {
-		sf := v.Type().Field(i)
-		tag := sf.Tag.Get("secret")
-		if tag == "" {
-			continue
-		}
-		if tag != "true" { // a rest slice with its own secret flag names
-			if f := cp.Field(i); f.Kind() == reflect.Slice {
-				f.Set(reflect.ValueOf(redactPairs(f.Interface().([]string), NewSet(strings.Split(tag, ",")...))))
-			}
-			continue
-		}
-		switch f := cp.Field(i); f.Kind() {
+	for _, field := range fieldsOf(v.Type()) {
+		f := cp.FieldByIndex(field.index)
+		switch f.Kind() {
 		case reflect.String:
-			if f.String() != "" {
+			if field.secret == "true" && f.String() != "" {
 				f.SetString(Redacted)
+			} else {
+				f.SetString(RedactURL(f.String()))
 			}
 		case reflect.Slice:
 			n := f.Len()
-			red := make([]string, n)
-			for j := range red {
-				red[j] = Redacted
+			if n == 0 {
+				continue
+			}
+			if f.Type().Elem().Kind() != reflect.String {
+				continue
+			}
+			red := append([]string(nil), f.Interface().([]string)...)
+			if field.secret != "" && field.secret != "true" {
+				red = redactPairs(red, NewSet(strings.Split(field.secret, ",")...))
+			}
+			for j := 0; j < n; j++ {
+				if field.secret == "true" {
+					red[j] = Redacted
+				} else {
+					red[j] = RedactURL(red[j])
+				}
 			}
 			f.Set(reflect.ValueOf(red))
 		}
 	}
 	return cp.Interface().(Params)
+}
+
+// RedactURL removes a URL's complete userinfo, including token-only usernames.
+func RedactURL(s string) string {
+	if !strings.Contains(s, "://") {
+		return s
+	}
+	u, err := url.Parse(s)
+	if err != nil || u.User == nil {
+		return s
+	}
+	u.User = url.User(Redacted)
+	return u.String()
+}
+
+// RedactResources returns an independent list safe to place in an audit record.
+func RedactResources(rs []Resource) []Resource {
+	out := make([]Resource, len(rs))
+	for i, r := range rs {
+		r.Value = RedactURL(r.Value)
+		out[i] = r
+	}
+	return out
 }
 
 // redactPairs redacts the value that follows a secret flag in a flat
@@ -107,32 +140,6 @@ func redactPairs(rest []string, extra Set) []string {
 	out := append([]string(nil), rest...)
 	for i := 0; i+1 < len(out); i++ {
 		if (secretFlags[out[i]] || extra[out[i]]) && !strings.HasPrefix(out[i+1], "-") {
-			out[i+1] = Redacted
-			i++
-		}
-	}
-	return out
-}
-
-// RedactedArgv returns the original argv with secret flag values replaced —
-// the true command line as run, safe to log. Both `-p VALUE` and
-// `--flag=VALUE` forms are handled.
-func (p ParsedCommand) RedactedArgv() []string {
-	extra := Set{}
-	if sf, ok := p.cmd.(SecretFlagger); ok {
-		extra = NewSet(sf.SecretFlags()...)
-	}
-	isSecret := func(name string) bool { return secretFlags[name] || extra[name] }
-	out := append([]string(nil), p.raw...)
-	for i := 1; i < len(out); i++ {
-		a := out[i]
-		if name, _, hasEq := strings.Cut(a, "="); hasEq && strings.HasPrefix(a, "-") {
-			if isSecret(name) {
-				out[i] = name + "=" + Redacted
-			}
-			continue
-		}
-		if isSecret(a) && i+1 < len(out) && !strings.HasPrefix(out[i+1], "-") {
 			out[i+1] = Redacted
 			i++
 		}

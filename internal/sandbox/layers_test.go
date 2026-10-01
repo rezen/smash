@@ -37,7 +37,7 @@ func layerNames(t *testing.T, cfg Config) []string {
 func TestExecLayerOrdering(t *testing.T) {
 	names := layerNames(t, everythingOnConfig(t))
 	want := []string{
-		"unwrap", "audit", "deny", "sudo-grant", "mock",
+		"unwrap", "audit", "iterate", "deny", "sudo-grant", "mock",
 		"git-version", "sleep-cap",
 		"sh-interp", "tool-mktemp", "tool-sha256sum", "tool-base64", "uname",
 		"http", "egress", "gate", "tty",
@@ -76,7 +76,7 @@ func TestProfileModeLayers(t *testing.T) {
 	cfg.Profile = true
 	names := layerNames(t, cfg)
 	want := []string{
-		"unwrap", "audit", "sudo-grant",
+		"unwrap", "audit", "iterate", "sudo-grant",
 		"sh-interp", "tool-mktemp", "tool-sha256sum", "tool-base64", "uname", "http", "tty",
 	}
 	if !slices.Equal(names, want) {

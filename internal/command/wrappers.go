@@ -6,10 +6,10 @@ package command
 // curl/wget interception, and the egress guard. Unwrap peels them so every
 // guard enforces on the real command.
 //
-// Wrapper semantics (privilege, timeout, env vars, xargs iteration) are dropped:
-// in a sandbox, confining the real command matters more than preserving the
-// wrapper's behaviour. Stripping sudo/doas is itself a feature — the inner
-// command runs confined instead of actually escalating.
+// Prefix wrapper effects such as privilege and environment changes are dropped.
+// Stripping sudo/doas means the inner command runs confined without escalating.
+// Find and Xargs are iterators: the sandbox runs their inner invocations
+// through the full stack for each item.
 
 import "strings"
 
@@ -88,9 +88,8 @@ func (w Sudo) Unwrap(a []string) []string {
 	return nil
 }
 
-// Xargs is its own type: unlike a plain prefix wrapper it feeds stdin items as
-// arguments to the inner command (dropped here — confining the command name is
-// what matters), and with NO command it defaults to running echo. Note `-i` is
+// Xargs feeds stdin items as arguments to its inner command, and with NO
+// command it defaults to running echo. Note `-i` is
 // deliberately NOT a value flag: its replace-string is optional and attached
 // (`-i{}`), so treating it as consuming the next arg would swallow the command
 // (`xargs -i rm` → inner `rm`, not `-i`'s value).
@@ -101,12 +100,6 @@ var xargsSpec = Spec{ValueFlags: NewSet("-n", "-P", "-I", "-d", "-E", "-s", "-L"
 
 func (Xargs) Names() []string                { return []string{"xargs"} }
 func (Xargs) Parse(a []string) ParsedCommand { return xargsSpec.Parse(a) }
-func (Xargs) Unwrap(a []string) []string {
-	if inner := innerAfter(a, xargsSpec.ValueFlags, 0, false); len(inner) > 0 {
-		return inner
-	}
-	return []string{"echo"} // xargs with no command runs echo
-}
 
 // innerAfter finds where a wrapper's inner command begins: skip the wrapper's
 // flags (+ their values), env-style assignments, and skipPos leading positionals
@@ -158,9 +151,13 @@ func isAssignment(s string) bool {
 // wrapper names seen plus the innermost real command argv. A wrapper with no
 // inner command is treated as a normal command, not a wrapper.
 func Unwrap(args []string) (chain []string, inner []string) {
+	return Default.Unwrap(args)
+}
+
+func (r *Registry) Unwrap(args []string) (chain []string, inner []string) {
 	inner = args
 	for len(inner) > 0 {
-		w, ok := Lookup(inner[0]).(Wrapper)
+		w, ok := r.Lookup(inner[0]).(Wrapper)
 		if !ok {
 			break
 		}

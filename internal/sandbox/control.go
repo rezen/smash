@@ -114,10 +114,6 @@ func globRE(pattern string) *regexp.Regexp {
 	return regexp.MustCompile(b.String())
 }
 
-// MatchFunc adapts any predicate over the parsed command (typed params
-// included: p.TypedParams().(command.CurlParams).Follow, …).
-func MatchFunc(f func(p command.ParsedCommand) bool) Matcher { return f }
-
 // And requires every matcher; Or accepts any.
 func (m Matcher) And(others ...Matcher) Matcher {
 	return func(p command.ParsedCommand) bool {
@@ -192,7 +188,7 @@ func mockMiddleware(mocks []*Mock) Middleware {
 			if len(args) == 0 {
 				return next(ctx, args)
 			}
-			p := command.Parse(args)
+			p := parsedFrom(ctx, args)
 			for _, m := range mocks {
 				if m.Match == nil || !m.Match(p) {
 					continue

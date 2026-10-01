@@ -30,6 +30,24 @@ type Wrapper interface {
 	Unwrap(args []string) []string
 }
 
+// Iterator describes a command that runs an inner command for each input item.
+type Iterator interface {
+	Plan(p ParsedCommand) (Iteration, bool)
+}
+
+type Iteration struct {
+	Driver      []string
+	Template    []string
+	Placeholder string
+	Batch       int
+	NUL         bool
+	Delimiter   string
+	Dir         bool
+	RunEmpty    bool
+	ArgFile     string
+	Trace       bool
+}
+
 // ScriptRunner is implemented by shells that run a `-c SCRIPT` string.
 type ScriptRunner interface {
 	DashC(args []string) (script string, params []string, ok bool)

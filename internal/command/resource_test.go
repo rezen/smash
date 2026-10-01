@@ -181,6 +181,20 @@ func TestRedact(t *testing.T) {
 	if got := g.String(); strings.Contains(got, "hunter2") || !strings.Contains(got, "-h db") {
 		t.Errorf("mysql redaction wrong: %q", got)
 	}
+	attached := Redact(Parse([]string{"mysql", "-pSECRET", "-h", "db"}).TypedParams()).String()
+	if strings.Contains(attached, "SECRET") || !strings.Contains(attached, "-p REDACTED") {
+		t.Errorf("attached password leaked: %q", attached)
+	}
+	url := Redact(Parse([]string{"curl", "https://user:TOKEN@host/x"}).TypedParams()).(CurlParams)
+	if strings.Contains(url.URL, "TOKEN") || url.URL != "https://REDACTED@host/x" {
+		t.Errorf("URL userinfo leaked: %+v", url)
+	}
+	if got := Redact(Parse([]string{"git", "clone", "https://x:TOKEN@github.com/a/b"}).TypedParams()).String(); strings.Contains(got, "TOKEN") {
+		t.Errorf("git URL userinfo leaked: %q", got)
+	}
+	if rs := RedactResources([]Resource{{Kind: "url", Value: "https://x:TOKEN@host/x"}}); strings.Contains(rs[0].Value, "TOKEN") {
+		t.Errorf("resource userinfo leaked: %+v", rs)
+	}
 	if got := Redact(Parse([]string{"frob", "--token=abc", "-x", "keep"}).TypedParams()).String(); strings.Contains(got, "abc") || !strings.Contains(got, "-x keep") {
 		t.Errorf("generic redaction wrong: %q", got)
 	}
@@ -200,12 +214,29 @@ func TestRedact(t *testing.T) {
 	if got := d.String(); strings.Contains(got, "hunter2") || !strings.Contains(got, "--password REDACTED") {
 		t.Errorf("docker password redaction wrong: %q", got)
 	}
-	// The as-run argv is redacted in place, both value forms.
-	if got := strings.Join(Parse([]string{"mysql", "-h", "db", "-p", "hunter2", "--password=x", "app"}).RedactedArgv(), " "); got != "mysql -h db -p REDACTED --password=REDACTED app" {
-		t.Errorf("RedactedArgv = %q", got)
-	}
 	// Non-secret params pass through untouched.
 	if b := Redact(Parse([]string{"base64", "-d", "f"}).TypedParams()).(Base64Params); !b.Decode || b.File != "f" {
 		t.Errorf("base64 params altered: %+v", b)
+	}
+}
+
+type embeddedAuditFields struct {
+	Password string `secret:"true"`
+	URL      string `resource:"url,fetch"`
+}
+type embeddedAuditParams struct{ embeddedAuditFields }
+
+func (p embeddedAuditParams) Args() []string { return []string{"sample"} }
+func (p embeddedAuditParams) String() string { return "sample" }
+
+func TestEmbeddedAuditTags(t *testing.T) {
+	p := embeddedAuditParams{embeddedAuditFields{Password: "SECRET", URL: "https://u:TOKEN@host/x"}}
+	r := Redact(p).(embeddedAuditParams)
+	if r.Password != Redacted || strings.Contains(r.URL, "TOKEN") {
+		t.Errorf("embedded redaction: %+v", r)
+	}
+	rs := resourcesOf(p)
+	if len(rs) != 1 || rs[0].Value != p.URL {
+		t.Errorf("embedded resources: %+v", rs)
 	}
 }

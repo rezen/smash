@@ -34,7 +34,8 @@ internal/command/   the command model (pure; no interp dependency)
   network.go    Curl/Wget/Openssl/SSH/Scp/Rsync/Netcat/Git/Perl/Python, Request + Downloader
   docker.go     DockerCommand — Docker/Podman/Nerdctl: split-argv parsing, per-subcommand params, registry egress
   shell.go      Shell + `-c` extraction
-  wrappers.go   PrefixWrapper, Xargs, Unwrap
+  wrappers.go   PrefixWrapper and Unwrap; iterate.go defines Find/Xargs iteration plans
+  context.go    parsed argv shared across execution layers
   builtins.go   Tool + the safe local tools, Grep/Sed/Awk/Tar/Base64/Find
   perms.go      chmod/chown/chgrp/chattr/setfacl/chflags/chcon/install (PathMutator)
   fileops.go    FileChange/FileOperator; rm/mv/cp/ln/mkdir/mktemp/tee/unzip/gzip/dd (monitoring)
@@ -52,6 +53,7 @@ internal/sandbox/   the enforcement stack on mvdan/sh
   control.go    Disable (deny-list) and Mock + Matchers (canned stdout/stderr/exit)
   allowlist.go  DefaultAllowList + DefaultSensitiveList + the command gate (unlisted runs audited; Strict) / in-sandbox escape hatch, shebang-aware
   middleware.go unwrap (+ the wrapper chain for the audit record), sudo-probe grant, git-version probe, sleep cap
+  iterate.go    find/xargs item collection and confined inner invocations
   shinterp.go   confined interpretation of `sh -c` and of in-root shell scripts
   controlling_tty_unix.go   /dev/tty routing and controlling-PTY session handoff
   network.go    Policy (structural URL matching), HTTP client wiring, egress guard

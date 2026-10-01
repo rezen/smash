@@ -29,7 +29,7 @@ type Manifest struct {
 	Version  int      `yaml:"version"`
 	OS       string   `yaml:"os,omitempty"`
 	Script   Script   `yaml:"script"`
-	Commands []string `yaml:"commands"`
+	Commands []string `yaml:"commands"` // host processes observed during profiling
 	// URLs are owner/repo URL prefixes for project-shaped GitHub-family
 	// downloads, applied as sandbox.Policy.AllowedPrefixes (scheme-pinned,
 	// whole-segment matching) — so a profiled GitHub fetch grants one
@@ -212,14 +212,17 @@ func NewProfiler(name, source string, next sandbox.Auditor) *Profiler {
 
 func (p *Profiler) Audit(rec sandbox.AuditRecord) {
 	p.mu.Lock()
-	if rec.Name != "" {
+	if rec.Name != "" && (rec.Served == "" || rec.Name == "find" && rec.Served == "iterate") {
 		p.commands[filepath.Base(rec.Name)] = true
 	}
-	for _, resource := range rec.Resources {
-		if resource.Kind == "url" {
-			p.recordURL(resource.Value)
-		} else if host := resourceHost(resource); host != "" {
-			p.hosts[host] = true
+	if rec.Egress != nil {
+		switch rec.Egress.Kind {
+		case command.EgressURL:
+			p.recordURL(rec.Egress.Target)
+		case command.EgressEndpoint:
+			if host := network.HostFromEndpoint(rec.Egress.Target); host != "" {
+				p.hosts[host] = true
+			}
 		}
 	}
 	// The in-process downloader observes what parsed argv cannot: the URL of
@@ -287,18 +290,4 @@ func (p *Profiler) recordURL(raw string) {
 	if host := network.HostFromEndpoint(raw); host != "" {
 		p.hosts[host] = true
 	}
-}
-
-// resourceHost extracts the host a network-ish resource touched, with the
-// SAME parser (network.HostFromEndpoint) Policy.AllowsTarget will use when
-// this manifest is later enforced — recording and matching cannot drift
-// apart. Resources of kind "url" go through recordURL instead, where a
-// project-shaped GitHub URL keeps its owner/repo path.
-func resourceHost(r command.Resource) string {
-	switch r.Kind {
-	case "repo", "remote", "host", "socket", "keyserver":
-	default:
-		return ""
-	}
-	return network.HostFromEndpoint(r.Value)
 }

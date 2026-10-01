@@ -81,17 +81,18 @@ check. When the command model recognizes `sh -c`, `bash -c`, or an equivalent
 shell runner, `smash` parses the string and executes it through a nested runner
 with the same policy. Nesting is depth-limited and covered by the run timeout.
 
-The policy also resolves wrappers before enforcement. This includes:
+The policy replaces these wrappers with their inner command before enforcement:
 
 - `sudo` and `doas`;
 - `env`, `command`, `time`, `nice`, `nohup`, `setsid`, and `stdbuf`;
-- `timeout` and `watch`;
-- `xargs`;
-- `find -exec`, `-execdir`, `-ok`, and `-okdir`.
+- `timeout` and `watch`.
 
-Consequently, `env curl`, `timeout 5 openssl s_client`, `sudo rm`, and `find
--exec sh -c …` are judged by their inner command. The wrapper chain remains in
-the audit record.
+`find -exec`, `-execdir`, `-ok`, `-okdir`, and `xargs` iterate over paths or
+input items. Each inner invocation passes through the full enforcement stack
+and has its iterator named in the audit wrapper chain. `find` supports one
+action clause terminated by `;` or `+`; unsupported combinations are refused.
+`xargs` supports common grouping, delimiter, replacement, input-file, and
+no-run-if-empty options and runs sequentially.
 
 `sudo CMD` and `doas CMD` are de-escalated: only `CMD` runs, without privilege
 escalation. With `allow-sudo` enabled, credential probes such as `sudo -v` and
@@ -209,7 +210,9 @@ resources, wrappers, file changes, exit status, timing, errors, policy-denial
 reasons, and bounded stdin/stdout samples.
 
 Fields and flags known to contain credentials—headers, cookies, passwords,
-keys, and command-specific secret options—are redacted before logging. This is
+keys, and command-specific secret options—are redacted before logging. Attached
+short values such as `-pSECRET` and URL userinfo are also redacted in commands,
+resources, egress targets, and denial messages. This is
 best-effort structural redaction; arbitrary secrets printed by a command can
 still appear when data capture is enabled. Choose the `audit.data` setting and
 log destination accordingly.
@@ -233,6 +236,12 @@ script itself). The hash does not establish who
 authored the script, and a profile is not a static proof of all possible
 behavior: different arguments, environment, platform, network responses, or
 timing may select branches that were not exercised.
+
+The `commands` list contains host processes observed during profiling.
+Interpreted shells and in-process tools such as `curl`, `wget`, and `mktemp`
+are served by the stack and are not listed. Host names come from explicit
+endpoint and URL targets; a named Git remote such as `origin` is not recorded
+as a host.
 
 Profiling is intentionally non-enforcing so discovery is not truncated by a
 Smash policy decision. Command denials, strict mode, mocks, downloader

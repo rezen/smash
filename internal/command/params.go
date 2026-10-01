@@ -97,6 +97,7 @@ type CurlParams struct {
 	Referer    string   `flag:"-e,--referer"`
 	Headers    []string `flag:"-H,--header" secret:"true"` // may carry Authorization
 	Cookies    []string `flag:"-b,--cookie" secret:"true"`
+	User       string   `flag:"-u,--user" secret:"true"`
 	// The data flags each have their own field because they differ in what a
 	// value means (@file or literal, newline stripping, URL-encoding) — see
 	// BodyParts — and rendering them under one spelling would change semantics.

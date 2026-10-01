@@ -54,6 +54,9 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+
       - name: Build
         run: go build ./...
 

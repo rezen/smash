@@ -73,8 +73,7 @@ func (Curl) Egress(p ParsedCommand) (string, bool) { return urlOperand(p) }
 func (Curl) Params(p ParsedCommand) Params         { return curlParamsFrom(p) }
 func (Curl) Request(p ParsedCommand) Request       { return curlParamsFrom(p).Request() }
 
-// Curl accepts credentials on the command line (`-u user:password`). The flag
-// is unmodelled, so only the raw argv carries it — redact it there.
+// Curl accepts credentials on the command line (`-u user:password`).
 func (Curl) SecretFlags() []string { return []string{"-u", "--user"} }
 
 // Request converts the typed params to a fetch intent.
@@ -168,7 +167,7 @@ func (Wget) SecretFlags() []string { return []string{"--http-password", "--proxy
 // redirects, and with no -O derives the output filename from the URL the way
 // the real tool does.
 func (w WgetParams) Request() Request {
-	r := Request{URL: w.URL, Headers: http.Header{}, Output: w.Output, RemoteName: w.Output == "", Follow: true}
+	r := Request{URL: w.URL, Headers: http.Header{}, Output: w.Output, RemoteName: w.Output == "", Follow: true, FailOnHTTP: true}
 	for _, h := range w.Headers {
 		addHeaderLine(r.Headers, h)
 	}
@@ -192,6 +191,9 @@ func (Openssl) Parse(a []string) ParsedCommand {
 
 // opensslSubcommand peeks at the subcommand so Parse can pick the right Spec.
 func opensslSubcommand(a []string) string {
+	if len(a) == 0 {
+		return ""
+	}
 	for _, x := range a[1:] {
 		if !strings.HasPrefix(x, "-") {
 			return x
@@ -298,6 +300,9 @@ func (Netcat) Egress(p ParsedCommand) (string, bool) {
 	if len(p.Operands) > 0 {
 		return strings.Join(p.Operands, ":"), true
 	}
+	if p.HasFlag("-l", "--listen") {
+		return "listen", true
+	}
 	return "", false
 }
 
@@ -305,9 +310,9 @@ func (Netcat) Egress(p ParsedCommand) (string, bool) {
 
 var (
 	gitSpec = Spec{Subcommand: true, ValueFlags: NewSet(
-		"-C", "-c", "--git-dir", "--work-tree", "--exec-path", "--namespace",
+		"-C", "-c", "--config", "--config-env", "--file", "--blob", "--git-dir", "--work-tree", "--exec-path", "--namespace",
 		"--upload-pack", "--depth", "-o", "-b", "--branch")}
-	gitRemoteSubcommands = NewSet("clone", "fetch", "pull", "push", "ls-remote", "remote", "submodule")
+	gitRemoteSubcommands = NewSet("clone", "fetch", "pull", "push", "ls-remote", "submodule")
 	// gitNamedRemote subcommands take the remote as their first operand and
 	// default to "origin" when it is omitted.
 	gitNamedRemote = NewSet("fetch", "pull", "push", "ls-remote")
@@ -325,10 +330,20 @@ func (Git) Parse(a []string) ParsedCommand { return gitSpec.Parse(a) }
 // unknown. `--all`/`--multiple` and `remote update` name no single remote and
 // report the subcommand itself.
 func (Git) Egress(p ParsedCommand) (string, bool) {
-	for _, setting := range p.Values("-c") {
+	for _, setting := range p.Values("-c", "--config", "--config-env") {
 		if dangerousGitConfig(setting) {
 			return "unsafe git config", true
 		}
+	}
+	if p.Subcommand == "config" && !p.HasFlag("--get", "--get-all", "--get-regexp", "--list", "-l") {
+		for _, setting := range p.Operands {
+			if dangerousGitConfig(setting) {
+				return "unsafe git config", true
+			}
+		}
+	}
+	if p.Subcommand == "remote" {
+		return gitRemoteEgress(p)
 	}
 	if p.Subcommand == "submodule" {
 		return "submodule", true // may read URLs and helpers from repository state
@@ -348,6 +363,28 @@ func (Git) Egress(p ParsedCommand) (string, bool) {
 		return "origin", true
 	}
 	return p.Subcommand, true
+}
+
+func gitRemoteEgress(p ParsedCommand) (string, bool) {
+	if len(p.Operands) == 0 {
+		return "", false
+	}
+	switch p.Operands[0] {
+	case "add", "set-url":
+		for _, o := range p.Operands[1:] {
+			if strings.Contains(o, "://") || strings.Contains(o, "@") {
+				return o, true
+			}
+		}
+		return "remote", true
+	case "update", "prune":
+		return "remote", true
+	case "show":
+		if len(p.Operands) > 1 {
+			return p.Operands[1], true
+		}
+	}
+	return "", false
 }
 
 // dangerousGitConfig identifies command-line settings that can rewrite a

@@ -475,7 +475,7 @@ func observeHTTPMiddleware(p Policy, root string) (Middleware, error) {
 func egressGuardMiddleware(p Policy) Middleware {
 	return func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 		return func(ctx context.Context, args []string) error {
-			parsed := command.Parse(args)
+			parsed := parsedFrom(ctx, args)
 			egress, networked := parsed.EgressInfo()
 			if !networked {
 				return next(ctx, args)
@@ -487,7 +487,7 @@ func egressGuardMiddleware(p Policy) Middleware {
 				allowed = p.AllowsGit(target)
 				if !allowed && egress.Kind == command.EgressIndicator { // a remote name: resolve it
 					if url := resolveGitRemote(hc.Dir, hc.Env, parsed); url != "" {
-						target = target + " = " + url
+						target = target + " = " + command.RedactURL(url)
 						allowed = p.AllowsGit(url)
 					}
 				}
@@ -495,7 +495,7 @@ func egressGuardMiddleware(p Policy) Middleware {
 				allowed = p.AllowsTarget(target) // an indicator stays denied: it names no place
 			}
 			if !allowed {
-				return failf(hc.Stderr, 1, "[sandbox] network egress denied: %s → %s", parsed.Name, target)
+				return failf(hc.Stderr, 1, "[sandbox] network egress denied: %s → %s", parsed.Name, command.RedactURL(target))
 			}
 			return next(ctx, args)
 		}

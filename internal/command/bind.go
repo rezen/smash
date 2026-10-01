@@ -32,12 +32,17 @@ import (
 )
 
 type boundField struct {
-	index   []int        // field index path (embedded structs flatten)
-	kind    reflect.Kind // Bool, String or Slice (of string)
-	flags   []string
-	operand string // "", "url", "first", "all"
-	role    string // "", "subcommand", "rest"
+	index    []int        // field index path (embedded structs flatten)
+	kind     reflect.Kind // Bool, String or Slice (of string)
+	flags    []string
+	operand  string // "", "url", "first", "all"
+	role     string // "", "subcommand", "rest"
+	cmdline  bool
+	resource resourceTag
+	secret   string
 }
+
+type resourceTag struct{ kind, action, stream string }
 
 var fieldCache sync.Map // reflect.Type → []boundField
 
@@ -68,13 +73,28 @@ func collectFields(t reflect.Type, base []int) []boundField {
 		}
 		f.operand = sf.Tag.Get("operand")
 		f.role = sf.Tag.Get("role")
-		if len(f.flags) == 0 && f.operand == "" && f.role == "" {
+		f.cmdline = len(f.flags) > 0 || f.operand != "" || f.role != ""
+		f.secret = sf.Tag.Get("secret")
+		if tag := sf.Tag.Get("resource"); tag != "" {
+			parts := strings.SplitN(tag, ",", 3)
+			f.resource.kind = parts[0]
+			if len(parts) > 1 {
+				f.resource.action = parts[1]
+			}
+			if len(parts) > 2 {
+				f.resource.stream = parts[2]
+			}
+		}
+		if !f.cmdline && f.resource.kind == "" && f.secret == "" {
 			continue // untagged: not part of the command line
 		}
 		isStrings := f.kind == reflect.Slice && sf.Type.Elem().Kind() == reflect.String
 		okKind := f.kind == reflect.String || isStrings || (f.kind == reflect.Bool && len(f.flags) > 0)
-		if !okKind || (f.role == "rest" && !isStrings) || ((f.operand == "all" || f.operand == "rest") && !isStrings) {
+		if (f.cmdline || f.resource.kind != "" || f.secret != "") && (!okKind || (f.role == "rest" && !isStrings) || ((f.operand == "all" || f.operand == "rest") && !isStrings)) {
 			panic(fmt.Sprintf("command: %s.%s: unsupported type %s for its tag", t.Name(), sf.Name, sf.Type))
+		}
+		if f.secret != "" && f.secret != "true" && (f.role != "rest" || !isStrings) {
+			panic(fmt.Sprintf("command: %s.%s: secret flag list requires role rest", t.Name(), sf.Name))
 		}
 		fields = append(fields, f)
 	}
@@ -87,6 +107,9 @@ func collectFields(t reflect.Type, base []int) []boundField {
 func specOf(proto any, clusterShort bool, extraValueFlags ...string) Spec {
 	s := Spec{ClusterShort: clusterShort, ValueFlags: NewSet(extraValueFlags...)}
 	for _, f := range fieldsOf(reflect.TypeOf(proto)) {
+		if !f.cmdline {
+			continue
+		}
 		if f.role == "subcommand" {
 			s.Subcommand = true
 		}
@@ -107,6 +130,9 @@ func bind(p ParsedCommand, dst any) {
 	v := reflect.ValueOf(dst).Elem()
 	fields := fieldsOf(v.Type())
 	for _, f := range fields {
+		if !f.cmdline {
+			continue
+		}
 		fv := v.FieldByIndex(f.index)
 		switch {
 		case f.role == "subcommand":
@@ -182,6 +208,9 @@ func render(name string, src any, clusterShort bool) []string {
 	}
 	var operands []string
 	for _, f := range fields {
+		if !f.cmdline {
+			continue
+		}
 		fv := v.FieldByIndex(f.index)
 		switch {
 		case f.role == "subcommand":

@@ -87,6 +87,27 @@ func (Openssl) EgressKind(p ParsedCommand, target string) EgressKind {
 	return ClassifyEgress(target)
 }
 
+func (DockerCommand) EgressKind(p ParsedCommand, target string) EgressKind {
+	if target == p.Subcommand || target == "." || p.Subcommand == "compose" && len(p.Operands) > 0 && target == p.Operands[0] {
+		return EgressIndicator
+	}
+	return ClassifyEgress(target)
+}
+
+func (NetTool) EgressKind(p ParsedCommand, target string) EgressKind {
+	if len(p.Operands) == 0 && target == p.Name {
+		return EgressIndicator
+	}
+	return ClassifyEgress(target)
+}
+
+func (Netcat) EgressKind(p ParsedCommand, target string) EgressKind {
+	if p.HasFlag("-l", "--listen") {
+		return EgressIndicator
+	}
+	return ClassifyEgress(target)
+}
+
 // Git: URLs and scp-like remotes are places; a remote NAME ("origin"),
 // "submodule" and "unsafe git config" are indicators. The guard's git branch
 // resolves indicator names through .git/config before judging.

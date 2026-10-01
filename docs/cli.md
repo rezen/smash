@@ -58,7 +58,7 @@ audit target is a file or disabled.
 |---|---:|---|
 | `-policy FILE` | — | Read the base configuration from a YAML policy file |
 | `-init-policy FILE` | — | Write a commented policy template and exit; `-` writes to stdout |
-| `-profile` | false | Run and write the script SHA-256 plus observed commands, GitHub owner/repo URL prefixes, hosts (redirect hops included), and response media types to a manifest |
+| `-profile` | false | Run and write the script SHA-256 plus observed host processes, GitHub owner/repo URL prefixes, hosts (redirect hops included), and response media types to a manifest |
 | `-profile-output FILE` | `<script>.manifest.yaml` | Set the generated manifest path; requires `-profile` |
 | `-manifest FILE` | — | Verify the script SHA-256 and restrict commands, URL prefixes, and hosts to a manifest |
 | `-urls p1,p2` | GitHub's common download hosts | Replace the URL prefixes available to in-process `curl` and `wget` |
@@ -71,7 +71,7 @@ audit target is a file or disabled.
 | `-allow-sudo` | false | Make sudo/doas credential probes succeed; commands still run without escalation |
 | `-allow-in-root` | false | Permit native executables below the run root; this explicitly leaves in-process enforcement |
 | `-audit FILE\|-` | `-` | Write the audit stream to a file or stderr; an empty value disables it |
-| `-data N` | 0 | Capture at most `N` bytes each of command stdin and stdout |
+| `-data N` | 0 | Capture at most `N` bytes each of command stdin and pipe or file stdout; terminal-facing stdout remains attached to the PTY |
 | `-root DIR` | `sandbox` | Recreated directory used for the run's `HOME`, `TMPDIR`, and leading `PATH` |
 
 Comma-separated list flags do not trim or interpret their entries. URL entries
@@ -95,7 +95,6 @@ script:
   name: install.sh
   sha256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 commands:
-  - curl
   - mkdir
   - tar
 urls:

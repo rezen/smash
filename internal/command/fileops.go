@@ -14,6 +14,7 @@ package command
 
 import (
 	"path"
+	"sort"
 	"strings"
 )
 
@@ -258,25 +259,38 @@ func (u Unzip) Resources(p ParsedCommand) []Resource {
 // file is replaced by its (de)compressed sibling; -c streams instead; -k keeps.
 type Compress struct{}
 
-var compressExt = map[string]string{"gzip": ".gz", "bzip2": ".bz2", "xz": ".xz", "zstd": ".zst", "lz4": ".lz4"}
+var compressTypes = map[string]struct {
+	ext        string
+	decompress bool
+}{
+	"gzip": {".gz", false}, "gunzip": {".gz", true},
+	"bzip2": {".bz2", false}, "bunzip2": {".bz2", true},
+	"xz": {".xz", false}, "unxz": {".xz", true},
+	"zstd": {".zst", false}, "unzstd": {".zst", true},
+	"lz4": {".lz4", false}, "unlz4": {".lz4", true},
+}
+
+var compressSpec = Spec{ClusterShort: true, ValueFlags: NewSet("-S", "--suffix", "-T", "--threads")}
 
 func (Compress) Names() []string {
-	return []string{"gzip", "gunzip", "bzip2", "bunzip2", "xz", "unxz", "zstd", "unzstd", "lz4", "unlz4"}
+	names := make([]string, 0, len(compressTypes))
+	for name := range compressTypes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 func (Compress) Parse(a []string) ParsedCommand {
-	return Spec{ClusterShort: true, ValueFlags: NewSet("-S", "--suffix", "-T", "--threads")}.Parse(a)
+	return compressSpec.Parse(a)
 }
 func (Compress) builtin() {}
 func (Compress) FileChanges(p ParsedCommand) []FileChange {
 	if len(p.Operands) == 0 || p.HasFlag("-c", "--stdout", "--to-stdout", "-t", "--test", "-l", "--list") {
 		return nil
 	}
-	tool := strings.TrimPrefix(strings.TrimPrefix(p.Name, "un"), "g")
-	if p.Name == "gunzip" || p.Name == "gzip" {
-		tool = "gzip"
-	}
-	ext := compressExt[tool]
-	decompress := strings.HasPrefix(p.Name, "un") || p.Name == "gunzip" || p.HasFlag("-d", "--decompress", "--uncompress")
+	row := compressTypes[p.Name]
+	ext := row.ext
+	decompress := row.decompress || p.HasFlag("-d", "--decompress", "--uncompress")
 	var cs []FileChange
 	for _, f := range p.Operands {
 		out := f + ext

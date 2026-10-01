@@ -22,6 +22,8 @@ func TestEgressInfo(t *testing.T) {
 		{[]string{"curl", "example.com"}, "example.com", EgressEndpoint},
 		{[]string{"ssh", "user@host", "ls"}, "user@host", EgressEndpoint},
 		{[]string{"nc", "1.2.3.4", "4444"}, "1.2.3.4:4444", EgressEndpoint},
+		{[]string{"nc", "-l", "8080"}, "8080", EgressIndicator},
+		{[]string{"dig"}, "dig", EgressIndicator},
 		{[]string{"rsync", "-a", "host:src", "dst"}, "host:src", EgressEndpoint},
 		// openssl: -connect is a place; a bare s_client is a label
 		{[]string{"openssl", "s_client", "-connect", "example.com:443"}, "example.com:443", EgressEndpoint},
@@ -45,6 +47,13 @@ func TestEgressInfo(t *testing.T) {
 		{[]string{"git", "clone", "git@github.com:x/y.git"}, "git@github.com:x/y.git", EgressEndpoint},
 		{[]string{"git", "fetch", "origin"}, "origin", EgressIndicator},
 		{[]string{"git", "submodule", "update"}, "submodule", EgressIndicator},
+		{[]string{"git", "clone", "--config", "credential.helper=!x", "https://github.com/a/b"}, "unsafe git config", EgressIndicator},
+		{[]string{"git", "clone", "--config=credential.helper=!x", "https://github.com/a/b"}, "unsafe git config", EgressIndicator},
+		{[]string{"git", "config", "--global", "url.x.insteadOf", "https://github.com/"}, "unsafe git config", EgressIndicator},
+		{[]string{"git", "remote", "add", "origin", "https://evil.example/x"}, "https://evil.example/x", EgressURL},
+		{[]string{"git", "remote", "update"}, "remote", EgressIndicator},
+		{[]string{"docker", "login", "-u", "x", "-p", "y"}, "login", EgressIndicator},
+		{[]string{"docker", "login", "ghcr.io"}, "ghcr.io", EgressEndpoint},
 	}
 	for _, c := range cases {
 		egress, networked := Parse(c.argv).EgressInfo()

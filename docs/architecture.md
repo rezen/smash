@@ -19,8 +19,8 @@ For each external command, the runner follows this conceptual path:
 
 ```text
 shell AST
-  → unwrap wrappers
-  → identify and parse command family
+  → unwrap wrappers and parse the real command once
+  → iterate find/xargs actions when present
   → apply disable rules and mocks
   → reinterpret shell runners when needed
   → apply downloader, egress, and command gates
@@ -30,7 +30,8 @@ shell AST
 
 The concrete middleware ordering preserves two important properties: all guards
 see the real command behind wrappers, and an explicitly disabled command cannot
-be mocked back into existence.
+be mocked back into existence. The middleware stack is built once per run and
+shared by confined nested shells and iterator invocations.
 
 ## Command capabilities
 
@@ -42,7 +43,8 @@ while optional interfaces advertise behavior needed by guards and auditors.
 | `Command` | `Names`, `Parse` | Register names and turn argv into a `ParsedCommand` |
 | `Networked` | `Egress` | Describe whether and where an invocation accesses the network |
 | `Downloader` | `Request` | Supply an HTTP request for in-process `curl` or `wget` |
-| `Wrapper` | `Unwrap` | Expose commands hidden behind `sudo`, `env`, `xargs`, `find`, and similar tools |
+| `Wrapper` | `Unwrap` | Replace prefixes such as `sudo` and `env` with their inner command |
+| `Iterator` | `Plan` | Run `find -exec` and `xargs` once per item or batch through the full stack |
 | `ScriptRunner` | `DashC` | Expose a shell string for confined reinterpretation |
 | `Structured` | `Params` | Return a command-specific typed parameter struct |
 | `Describer` | `Resources` | Describe resources requiring command-specific logic |
@@ -84,7 +86,8 @@ Commands implementing `Structured` expose structs such as `CurlParams`,
 secrets, and resource semantics once. The binder derives parsing and rendering
 behavior from those tags, reducing drift between the accepted command line and
 the typed form. Anonymous embedded structs flatten, so a family of subcommands
-can share common fields (docker's `DockerGlobals`).
+can share common fields (docker's `DockerGlobals`). Resource and secret tags
+follow the same flattening rule as flag tags.
 
 Every `ParsedCommand` can render a normalized command line with `String()`.
 Where typed parameters exist, applications can inspect or edit the struct and
@@ -145,11 +148,15 @@ operations are identified as egress even when offline GPG work is allowed.
 their names for the audit record. It understands each wrapper's value-consuming
 options and positional syntax before returning the inner argv.
 
+`find -exec` and `xargs` are iterators. Their driver or input produces items,
+and each inner invocation enters the same confined stack with the iterator
+named in its audit wrapper chain.
+
 A shell command with `-c` is not passed to a host shell. `shInterpMiddleware`
 parses the string and builds a nested runner from the same configuration, so
 every inner command is enforced. Shell scripts installed inside the root take
-the same path. Recursion is depth-capped, and execution shares the run's context
-timeout.
+the same path. The runner reuses the run's middleware stack. Recursion is
+depth-capped, and execution shares the run's context timeout.
 
 ## Egress model
 
@@ -219,7 +226,9 @@ interpreter rather than an external command. An auditor implementing
 
 An `AuditRecord` contains the normalized command, typed parameters, resources,
 file changes, wrapper chain, exit status, duration, and any execution or policy
-error. `unlisted` and `in-root` identify how a command passed the gate.
+error. `Egress` carries the classified network target, and `Served` names an
+in-process layer that handled the command. `unlisted` and `in-root` identify
+how a command passed the gate.
 
 With `AuditData` enabled, middleware tees bounded stdin and stdout samples into
 the record. `TextAuditor` writes a YAML sequence that tools such as `yq` can

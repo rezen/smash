@@ -12,7 +12,9 @@ import (
 func TestProfilerBuildsStableManifest(t *testing.T) {
 	p := NewProfiler("install.sh", "echo hello\n", nil)
 	p.Audit(sandbox.AuditRecord{
-		Name: "curl",
+		Name:   "curl",
+		Served: "http",
+		Egress: &command.Egress{Target: "https://Downloads.Example.test/tool", Kind: command.EgressURL},
 		Resources: []command.Resource{
 			{Kind: "url", Action: "fetch", Value: "https://Downloads.Example.test/tool"},
 		},
@@ -27,21 +29,26 @@ func TestProfilerBuildsStableManifest(t *testing.T) {
 		ContentType: "application/gzip",
 		Sniffed:     "application/x-gzip",
 	})
-	p.Audit(sandbox.AuditRecord{Name: "uname"})
+	p.Audit(sandbox.AuditRecord{Name: "uname", Served: "uname"})
 	p.Audit(sandbox.AuditRecord{ // a project-shaped fetch scopes to owner/repo
-		Name: "curl",
+		Name:   "curl",
+		Served: "http",
+		Egress: &command.Egress{Target: "https://github.com/atuinsh/atuin/releases/latest/download/x", Kind: command.EgressURL},
 		Resources: []command.Resource{
 			{Kind: "url", Action: "fetch", Value: "https://github.com/atuinsh/atuin/releases/latest/download/x"},
 		},
 	})
 	p.Audit(sandbox.AuditRecord{ // too short to name a project → host fallback
-		Name: "curl",
+		Name:   "curl",
+		Served: "http",
+		Egress: &command.Egress{Target: "https://github.com/atuinsh", Kind: command.EgressURL},
 		Resources: []command.Resource{
 			{Kind: "url", Action: "fetch", Value: "https://github.com/atuinsh"},
 		},
 	})
 	p.Audit(sandbox.AuditRecord{
-		Name: "git",
+		Name:   "git",
+		Egress: &command.Egress{Target: "git@github.com:owner/repo.git", Kind: command.EgressEndpoint},
 		Resources: []command.Resource{
 			{Kind: "repo", Action: "clone", Value: "git@github.com:owner/repo.git"},
 		},
@@ -50,7 +57,7 @@ func TestProfilerBuildsStableManifest(t *testing.T) {
 	if m.OS != runtime.GOOS {
 		t.Errorf("OS = %q, want %q", m.OS, runtime.GOOS)
 	}
-	if got := strings.Join(m.Commands, ","); got != "curl,git,uname" {
+	if got := strings.Join(m.Commands, ","); got != "git" {
 		t.Errorf("commands = %s", got)
 	}
 	if got := strings.Join(m.URLs, ","); got != "https://api.github.com/repos/gruntwork-io/terragrunt,https://github.com/atuinsh/atuin" {

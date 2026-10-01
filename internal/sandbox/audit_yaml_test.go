@@ -149,3 +149,12 @@ func TestTextAuditorParamsTagParses(t *testing.T) {
 		t.Errorf("secret header value not redacted in:\n%s", s)
 	}
 }
+
+func TestTextAuditorFlattensDockerGlobals(t *testing.T) {
+	var buf bytes.Buffer
+	p := command.Parse([]string{"docker", "--context", "remote", "run", "alpine"})
+	TextAuditor(&buf).Audit(AuditRecord{Name: "docker", Params: p.TypedParams(), Command: p.String()})
+	if s := buf.String(); !bytes.Contains(buf.Bytes(), []byte("Context: remote")) || bytes.Contains(buf.Bytes(), []byte("DockerGlobals:")) {
+		t.Errorf("embedded fields not flattened: %s", s)
+	}
+}

@@ -22,13 +22,20 @@ import (
 
 const maxShDepth = 32
 
+type depthKey struct{}
+
+func depthFrom(ctx context.Context) int { n, _ := ctx.Value(depthKey{}).(int); return n }
+func withDepth(ctx context.Context, n int) context.Context {
+	return context.WithValue(ctx, depthKey{}, n)
+}
+
 func shInterpMiddleware(cfg Config) Middleware {
 	return func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 		return func(ctx context.Context, args []string) error {
 			if len(args) == 0 {
 				return next(ctx, args)
 			}
-			sr, ok := command.Lookup(args[0]).(command.ScriptRunner)
+			sr, ok := parsedFrom(ctx, args).Command().(command.ScriptRunner)
 			if !ok {
 				return next(ctx, args)
 			}
@@ -49,8 +56,12 @@ func shInterpMiddleware(cfg Config) Middleware {
 func interpret(ctx context.Context, cfg Config, hc interp.HandlerContext,
 	name, src string, params []string, posix bool, note string,
 ) error {
-	if cfg.depth >= maxShDepth {
-		return failf(hc.Stderr, 1, "[sandbox] shell nesting too deep (%d)", cfg.depth)
+	if n := gateNoteFrom(ctx); n != nil {
+		n.Served = "sh-interp"
+	}
+	depth := depthFrom(ctx)
+	if depth >= maxShDepth {
+		return failf(hc.Stderr, 1, "[sandbox] shell nesting too deep (%d)", depth)
 	}
 	prog, err := parseBash(name, src)
 	if err != nil {
@@ -66,12 +77,11 @@ func interpret(ctx context.Context, cfg Config, hc interp.HandlerContext,
 	sub.Stderr = hc.Stderr
 	sub.Args = params
 	sub.Posix = posix
-	sub.depth = cfg.depth + 1
 	runner, err := buildRunner(sub)
 	if err != nil {
 		return err
 	}
-	return runner.Run(ctx, prog)
+	return runner.Run(withDepth(ctx, depth+1), prog)
 }
 
 // scriptRunner interprets a shell script confined, the way `sh -c` is. The

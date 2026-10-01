@@ -7,6 +7,7 @@ package tool
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -133,7 +134,7 @@ func writeSHA256Sums(ctx context.Context, hc interp.HandlerContext, o sha256sumO
 }
 
 func sha256File(ctx context.Context, hc interp.HandlerContext, name string) (string, error) {
-	var r io.Reader = hc.Stdin
+	var r io.Reader = stdinOrEmpty(hc.Stdin)
 	var closeFile io.Closer
 	if name != "-" {
 		path := name
@@ -161,6 +162,13 @@ type contextReader struct {
 	r   io.Reader
 }
 
+func stdinOrEmpty(r io.Reader) io.Reader {
+	if r == nil {
+		return bytes.NewReader(nil)
+	}
+	return r
+}
+
 func (r *contextReader) Read(p []byte) (int, error) {
 	if err := r.ctx.Err(); err != nil {
 		return 0, err
@@ -171,7 +179,7 @@ func (r *contextReader) Read(p []byte) (int, error) {
 func checkSHA256Sums(ctx context.Context, hc interp.HandlerContext, o sha256sumOptions) error {
 	valid, malformed, failed := 0, 0, false
 	for _, listName := range o.files {
-		var r io.Reader = hc.Stdin
+		var r io.Reader = stdinOrEmpty(hc.Stdin)
 		var f *os.File
 		if listName != "-" {
 			path := listName

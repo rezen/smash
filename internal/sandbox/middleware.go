@@ -16,16 +16,29 @@ import (
 // unwrapMiddleware rewrites a wrapped invocation (`sudo -E sh -c …`, `env X=1
 // curl …`, `find … -exec rm {} ;`) to its inner command so every downstream
 // exec handler enforces on the real command. See command.Unwrap.
-func unwrapMiddleware(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
-	return func(ctx context.Context, args []string) error {
-		chain, inner := command.Unwrap(args)
-		if len(chain) == 0 {
-			return next(ctx, args)
-		}
-		hc := interp.HandlerCtx(ctx)
-		fmt.Fprintf(hc.Stderr, "[sandbox] unwrapped %s → %s\n", strings.Join(chain, "+"), inner[0])
-		return next(withWrappers(ctx, chain), inner)
+func unwrapMiddleware(reg *command.Registry) Middleware {
+	if reg == nil {
+		reg = command.Default
 	}
+	return func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
+		return func(ctx context.Context, args []string) error {
+			chain, inner := reg.Unwrap(args)
+			if len(chain) > 0 {
+				hc := interp.HandlerCtx(ctx)
+				fmt.Fprintf(hc.Stderr, "[sandbox] unwrapped %s → %s\n", strings.Join(chain, "+"), inner[0])
+				ctx = withWrappers(ctx, append(append([]string(nil), wrappersFrom(ctx)...), chain...))
+			}
+			ctx = command.WithParsed(ctx, reg.Parse(inner))
+			return next(ctx, inner)
+		}
+	}
+}
+
+func parsedFrom(ctx context.Context, args []string) command.ParsedCommand {
+	if p, ok := command.ParsedFrom(ctx, args); ok {
+		return p
+	}
+	return command.Parse(args)
 }
 
 // The wrappers a command was reached through travel on the context so the
@@ -104,6 +117,9 @@ func sleepCapMiddleware(maxCap time.Duration) Middleware {
 
 // parseSleep parses a sleep argument like "20", "20s", "1m", "0.5".
 func parseSleep(s string) (time.Duration, bool) {
+	if s == "infinity" || s == "inf" {
+		return time.Duration(1<<63 - 1), true
+	}
 	mult := time.Second
 	if n := len(s); n > 0 {
 		switch s[n-1] {

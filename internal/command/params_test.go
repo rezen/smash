@@ -69,7 +69,7 @@ func TestCurlDataFlags(t *testing.T) {
 }
 
 func TestCurlUserIsRedacted(t *testing.T) {
-	argv := strings.Join(Parse([]string{"curl", "-u", "alice:hunter2", "https://x"}).RedactedArgv(), " ")
+	argv := Redact(Parse([]string{"curl", "-u", "alice:hunter2", "https://x"}).TypedParams()).String()
 	if strings.Contains(argv, "hunter2") || !strings.Contains(argv, "-u REDACTED") {
 		t.Errorf("curl -u leaks credentials: %q", argv)
 	}
