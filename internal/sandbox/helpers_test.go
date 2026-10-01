@@ -67,6 +67,12 @@ func (b *lockedBuffer) String() string {
 	return b.buf.String()
 }
 
+func (b *lockedBuffer) Reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf.Reset()
+}
+
 // runConfined runs script through the full sandbox in a fresh temp root with
 // the default policy and allow-list, returning captured stdout and stderr.
 func runConfined(t *testing.T, script string, opts ...option) (stdout, stderr string, err error) {

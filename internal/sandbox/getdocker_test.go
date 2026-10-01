@@ -1,9 +1,30 @@
 package sandbox
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// withFakeDocker puts a stand-in `docker` on the sandbox PATH. get-docker only
+// prints its "docker already exists" warning — and runs the 20s countdown the
+// cap assertion is about — when it finds one, so without this the test would
+// depend on whether the host has Docker installed (a developer Mac does; the
+// macOS CI runner does not).
+func withFakeDocker(t *testing.T) option {
+	t.Helper()
+	return func(cfg *Config) {
+		bin := filepath.Join(cfg.Root, "home", "bin")
+		if err := os.MkdirAll(bin, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(bin, "docker"), []byte(fakeBinary("docker")), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg.Env = envWith(cfg.Env, "PATH="+bin+":"+strings.TrimPrefix(hostPath, "PATH="))
+	}
+}
 
 // ubuntuEmulation fakes just enough Linux for get-docker to get past its
 // OS/distro detection on a non-Linux host: a Linux `uname` and a virtual
@@ -27,6 +48,7 @@ func ubuntuEmulation() Emulation {
 func TestGetDockerLinuxContained(t *testing.T) {
 	out, er, err := runConfined(t, fixture(t, "get-docker"),
 		withHome(t, "SHELL=/bin/sh", "CHANNEL=stable"),
+		withFakeDocker(t),
 		func(c *Config) {
 			c.Allowed = c.Allowed.With("which")
 			c.Emulation = ubuntuEmulation()

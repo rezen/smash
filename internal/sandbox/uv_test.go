@@ -2,7 +2,6 @@ package sandbox
 
 import (
 	"archive/tar"
-	"bytes"
 	"compress/gzip"
 	"os"
 	"path"
@@ -27,7 +26,7 @@ func TestUVInstallerAuditTrail(t *testing.T) {
 	var recs []AuditRecord
 	var download, checksum *Mock
 	var cfg Config
-	var out, er bytes.Buffer
+	var out, er lockedBuffer
 	var artifact string
 	_, _, err := runConfined(t, src, withHome(t), func(c *Config) {
 		installDir := filepath.Join(c.Dir, ".local", "bin")

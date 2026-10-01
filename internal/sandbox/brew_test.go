@@ -5,7 +5,29 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
+
+// skipUnlessBrewNeedsSudo skips hosts where brew's Linux installer never
+// reaches the sudo probe these tests are about. The script only asks for sudo
+// when neither its prefix, /home/linuxbrew nor /home is writable, and it skips
+// the privileged `install -d` when the prefix already exists — so a host with
+// Linuxbrew preinstalled (GitHub's ubuntu runners ship it, owned by the runner
+// user) or a writable /home takes a different path entirely. Root is skipped
+// for the same reason: brew drops the probe and would install for real.
+func skipUnlessBrewNeedsSudo(t *testing.T) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("as root brew skips the sudo probe and would install for real")
+	}
+	if _, err := os.Stat("/home/linuxbrew"); err == nil {
+		t.Skip("/home/linuxbrew already exists: brew would not need to create its prefix")
+	}
+	if unix.Access("/home", unix.W_OK) == nil {
+		t.Skip("/home is writable: brew's Linux installer would not need sudo")
+	}
+}
 
 // TestBrewInstallerContained runs Homebrew's installer (fixtures/brew-install.sh)
 // under Linux/x86_64 emulation, where it targets /home/linuxbrew/.linuxbrew —
@@ -21,9 +43,7 @@ import (
 // on a Homebrew host) and, once the sudo probe fails, run its chowns and
 // `git init` directly — which is why this test always emulates Linux.
 func TestBrewInstallerContained(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("as root brew skips the sudo probe and would install for real")
-	}
+	skipUnlessBrewNeedsSudo(t)
 	var recs []AuditRecord
 	var root string
 	out, er, err := runConfined(t, fixture(t, "brew-install.sh"),
@@ -73,9 +93,7 @@ func TestBrewInstallerContained(t *testing.T) {
 // unwrapped to a confined `install` and stopped by the disable list. The
 // grant exposes what the installer would do with root; it never escalates.
 func TestBrewInstallerSudoGranted(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("as root brew skips the sudo probe and would install for real")
-	}
+	skipUnlessBrewNeedsSudo(t)
 	var recs []AuditRecord
 	var root string
 	out, er, err := runConfined(t, fixture(t, "brew-install.sh"),
