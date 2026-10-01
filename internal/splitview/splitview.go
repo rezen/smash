@@ -445,10 +445,18 @@ func encodeKey(event *tcell.EventKey, appCursor bool) []byte {
 		} else {
 			value = string(r)
 		}
-	case key >= tcell.KeyCtrlSpace && key <= tcell.KeyCtrlUnderscore:
-		value = string(byte(key))
-	case key == tcell.KeyBackspace2:
+	case key == tcell.KeyBackspace || key == tcell.KeyBackspace2:
+		// tcell reports both ^H and DEL as KeyBackspace. Send DEL: it is what
+		// xterm-style terminals send and the PTY's default erase character.
 		value = "\x7f"
+	case key >= tcell.KeyCtrlSpace && key <= tcell.KeyCtrlUnderscore:
+		// Since tcell 2.10 the Ctrl keys are numbered from KeyCtrlSpace (64)
+		// rather than from 0, so the control character is the offset.
+		value = string(byte(key - tcell.KeyCtrlSpace))
+	case key <= tcell.KeyUS:
+		// The ASCII control codes tcell reports without a Ctrl modifier:
+		// Enter (CR), Tab, Escape and the rest below 0x20.
+		value = string(byte(key))
 	case key == tcell.KeyUp:
 		value = cursorSequence(appCursor, "A")
 	case key == tcell.KeyDown:
