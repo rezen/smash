@@ -3,7 +3,7 @@ module github.com/rezen/smash
 go 1.26.0
 
 require (
-	connectrpc.com/connect v1.21.0
+	connectrpc.com/connect v1.21.1
 	github.com/creack/pty/v2 v2.0.1
 	github.com/gdamore/tcell/v2 v2.13.10
 	github.com/hinshun/vt10x v0.0.0-20220301184237-5011da428d02
